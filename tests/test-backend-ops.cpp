@@ -4357,6 +4357,13 @@ struct test_gated_delta_net : public test_case {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
+    double max_nmse_err() override {
+        // The CUDA/HIP chunked prefill kernel (head_size 128, n_seq_tokens >= 128, K == 1) runs
+        // its GEMMs on fp16 tensor cores with fp32 accumulation; long accumulations land at
+        // NMSE ~1e-7..4e-7 vs the fp32 reference. Short shapes keep the strict default.
+        return (head_size == 128 && n_seq_tokens >= 128) ? 1e-6 : 1e-7;
+    }
+
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
@@ -10104,6 +10111,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 2));
+    // head_size=128 long-sequence shapes: eligible for the CUDA/HIP chunked prefill kernel
+    // (n_seq_tokens >= 128, K == 1, not KDA); shorter/other shapes fall back to recurrent.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  128, 1, 3));  // qwen4exp GQA (H_k=16, H_v=48), at threshold
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  300, 2, 3));  // partial last chunk + 2 seqs
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  100, 1, 3));  // below threshold -> recurrent
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128,  512, 1));     // MHA mid-length
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 2048, 1));     // longest accumulation (fp16 precision margin)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
