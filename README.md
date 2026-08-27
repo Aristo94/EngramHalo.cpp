@@ -1,3 +1,21 @@
+# EngramHalo.cpp
+
+**llama.cpp, tuned for Qwen 3.8 Flash-Next on AMD Strix Halo** (Ryzen AI MAX+
+395 / Radeon 8060S, gfx1151): RDNA 3.5 kernel patches, true QSA sparse *gather*
+instead of dense masking, a working MTP draft head, and the model's 27 GB
+engram table living happily on SSD. Measured: **23.5 → 39.3 tok/s** on code,
+depth performance roughly doubled, quality untouched (PPL Δ 0.03%).
+
+➜ **Start here: [docs/strix-halo/README.md](docs/strix-halo/README.md)** —
+benchmarks, recommended configs, container build, MTP sidecar
+([prebuilt on HF](https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF)).
+
+Based on [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+([PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742) lineage);
+the original README follows below.
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
