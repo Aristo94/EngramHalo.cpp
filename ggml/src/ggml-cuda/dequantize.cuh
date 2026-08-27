@@ -119,6 +119,19 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// single-block variant (qk = QK4_NL) for rows that do not cover whole QK_K super-blocks,
+// e.g. gather tables with a row size that is a multiple of 32 but not of 256
+static __device__ __forceinline__ void dequantize_iq4_nl_b32(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_iq4_nl * x = (const block_iq4_nl *) vx;
+
+    const float d = x[ib].d;
+
+    const int vui = x[ib].qs[iqs];
+
+    v.x = d * kvalues_iq4nl[vui & 0xF];
+    v.y = d * kvalues_iq4nl[vui >>  4];
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

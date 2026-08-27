@@ -1818,9 +1818,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+
+        // remember the lazily-read tensors that actually read from a mapping, so that
+        // prefetch_rows() can queue readahead for their gathers; a tensor that was routed
+        // to a non-mapped buffer (e.g. offloaded by an override) was copied out instead
+        for (const ggml_tensor * t : ml.lazy_tensors) {
+            if (t == nullptr || t->data == nullptr) {
+                continue;
+            }
+            for (const auto & mapping : pimpl->mappings) {
+                const char * a = (const char *) mapping->addr();
+                if ((const char *) t->data >= a && (const char *) t->data < a + mapping->size()) {
+                    lazy_read_tensors.insert(t);
+                    break;
+                }
+            }
+        }
     }
 
     return true;
+}
+
+void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const {
+    if (t == nullptr || t->data == nullptr || n_rows == 0 || lazy_read_tensors.count(t) == 0) {
+        return;
+    }
+
+    llama_mmap::prefetch_rows(t->data, t->nb[1], ggml_row_size(t->type, t->ne[0]), rows, n_rows);
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
