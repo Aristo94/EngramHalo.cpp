@@ -48,6 +48,193 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
+#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+
+// Exact top-k selection for rows wider than the bitonic sort limit of 1024 columns,
+// via iterative 8-bit radix selection on the order-preserving unsigned transform of the keys.
+// The kernels are plain HIP kernels without library dependencies, so unlike hipCUB the path
+// is safe to capture in HIP graphs (see the hipCUB/hipGraph interaction in llama.cpp#26592).
+// The resulting indices are in no particular order, matching the ggml_top_k contract (ggml.h).
+
+static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t mask = (uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000U;
+    return bits ^ mask;
+}
+
+struct top_k_radix_state {
+    uint32_t prefix;        // known high bits of the k-th largest key
+    uint32_t prefix_mask;   // which bits of prefix are valid
+    int      rank;          // how many elements of the prefix bin still belong to the top k
+    int      greater_count; // output slots taken by elements strictly greater than the threshold
+    int      equal_count;   // elements equal to the threshold seen so far during the gather
+};
+
+static __global__ void top_k_radix_init(top_k_radix_state * states, const int nrows, const int k) {
+    const int row = blockIdx.x*blockDim.x + threadIdx.x;
+    if (row < nrows) {
+        states[row] = {0, 0, k, 0, 0};
+    }
+}
+
+template<int BLOCK_SIZE, int RADIX_BITS>
+static __global__ void top_k_radix_histogram(
+        const float * __restrict__ src,
+        const top_k_radix_state * __restrict__ states,
+        int * __restrict__ block_histograms,
+        const int ncols,
+        const int blocks_per_row,
+        const int shift) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+    static_assert(NBINS == BLOCK_SIZE, "one thread per histogram bin");
+
+    const int     row       = blockIdx.y;
+    const int     row_block = blockIdx.x;
+    const int     tid       = threadIdx.x;
+    const float * row_src   = src + (size_t) row*ncols;
+
+    __shared__ int histogram[NBINS];
+
+    histogram[tid] = 0;
+    __syncthreads();
+
+    // count only the elements that still match the prefix found so far
+    const top_k_radix_state state = states[row];
+    for (int col = row_block*BLOCK_SIZE + tid; col < ncols; col += blocks_per_row*BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if ((key & state.prefix_mask) == state.prefix) {
+            atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
+        }
+    }
+    __syncthreads();
+
+    const size_t histogram_offset = ((size_t) row*blocks_per_row + row_block)*NBINS;
+    block_histograms[histogram_offset + tid] = histogram[tid];
+}
+
+template<int BLOCK_SIZE, int RADIX_BITS>
+static __global__ void top_k_radix_select(
+        const int * __restrict__ block_histograms,
+        top_k_radix_state * __restrict__ states,
+        const int blocks_per_row,
+        const int shift) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+    static_assert(NBINS == BLOCK_SIZE, "one thread per histogram bin");
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __shared__ int histogram[NBINS];
+
+    int count = 0;
+    for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
+        const size_t offset = ((size_t) row*blocks_per_row + row_block)*NBINS;
+        count += block_histograms[offset + tid];
+    }
+    histogram[tid] = count;
+    __syncthreads();
+
+    // walk the bins from the largest keys down until the bin holding the k-th largest key is found
+    if (tid == 0) {
+        top_k_radix_state state = states[row];
+        int bin = NBINS - 1;
+        while (bin > 0 && histogram[bin] < state.rank) {
+            state.rank -= histogram[bin--];
+        }
+        state.prefix      |= (uint32_t) bin << shift;
+        state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+        if (shift == 0) {
+            // last pass: the counters double as output cursors for the gather
+            state.greater_count = 0;
+            state.equal_count   = 0;
+        }
+        states[row] = state;
+    }
+}
+
+template<int BLOCK_SIZE>
+static __global__ void top_k_radix_gather(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        top_k_radix_state * __restrict__ states,
+        const int ncols,
+        const int k,
+        const int blocks_per_row) {
+    const int row       = blockIdx.y;
+    const int row_block = blockIdx.x;
+    const int tid       = threadIdx.x;
+
+    const float *       row_src = src + (size_t) row*ncols;
+    int *               row_dst = dst + (size_t) row*k;
+    top_k_radix_state * state   = &states[row];
+
+    // after all passes state->prefix is the exact key of the k-th largest element:
+    // all strictly greater elements are selected, ties on the threshold fill the remaining rank slots
+    const uint32_t threshold = state->prefix;
+    const int      rank      = state->rank;
+
+    for (int col = row_block*BLOCK_SIZE + tid; col < ncols; col += blocks_per_row*BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if (key > threshold) {
+            const int pos = atomicAdd(&state->greater_count, 1);
+            row_dst[pos] = col;
+        } else if (key == threshold) {
+            const int pos = atomicAdd(&state->equal_count, 1);
+            if (pos < rank) {
+                row_dst[k - rank + pos] = col;
+            }
+        }
+    }
+}
+
+static void top_k_radix_cuda(ggml_cuda_pool & pool,
+                             const float *    src,
+                             int *            dst,
+                             const int64_t    ncols,
+                             const int64_t    nrows,
+                             const int        k,
+                             cudaStream_t     stream) {
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int RADIX_BITS = 8;
+    constexpr int NBINS      = 1 << RADIX_BITS;
+
+    // grid.y is limited to 65535, taller inputs are processed in chunks of rows
+    const int64_t chunk_nrows = std::min<int64_t>(nrows, 65535);
+
+    // one block per 1024 columns and row, but capped so that the temporary histogram
+    // buffer stays bounded (<= 16 MiB) when there are both many rows and wide rows
+    const int blocks_per_row_cols = (int) std::min<int64_t>((ncols + 1023) / 1024, 64);
+    const int blocks_per_row      = std::max(1, std::min<int>(blocks_per_row_cols, (int) (16384/chunk_nrows)));
+
+    ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, chunk_nrows);
+    ggml_cuda_pool_alloc<int>               histograms_alloc(pool, (size_t) chunk_nrows*blocks_per_row*NBINS);
+
+    top_k_radix_state * states     = states_alloc.get();
+    int *               histograms = histograms_alloc.get();
+
+    for (int64_t row0 = 0; row0 < nrows; row0 += chunk_nrows) {
+        const int     iter_nrows = (int) std::min<int64_t>(chunk_nrows, nrows - row0);
+        const float * src_chunk  = src + row0*ncols;
+        int *         dst_chunk  = dst + row0*k;
+
+        top_k_radix_init<<<(iter_nrows + BLOCK_SIZE - 1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+                states, iter_nrows, k);
+
+        const dim3 histogram_grid(blocks_per_row, iter_nrows);
+        for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+            top_k_radix_histogram<BLOCK_SIZE, RADIX_BITS><<<histogram_grid, BLOCK_SIZE, 0, stream>>>(
+                    src_chunk, states, histograms, (int) ncols, blocks_per_row, shift);
+            top_k_radix_select<BLOCK_SIZE, RADIX_BITS><<<iter_nrows, BLOCK_SIZE, 0, stream>>>(
+                    histograms, states, blocks_per_row, shift);
+        }
+
+        top_k_radix_gather<BLOCK_SIZE><<<histogram_grid, BLOCK_SIZE, 0, stream>>>(
+                src_chunk, dst_chunk, states, (int) ncols, k, blocks_per_row);
+    }
+}
+
+#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -96,6 +283,13 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         dst_d  += k     * iter_nrows;
     }
 #else                             // GGML_CUDA_USE_CUB
+#ifdef GGML_USE_HIP
+    if (ncols > 1024) {
+        // the bitonic sort below is limited to 1024 columns, use radix selection for wider rows
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, (int) k, stream);
+        return;
+    }
+#endif // GGML_USE_HIP
     ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
     int *                     tmp_dst = temp_dst_alloc.get();
     argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
