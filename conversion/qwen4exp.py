@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from torch import Tensor
@@ -27,8 +27,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
     # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -68,14 +66,18 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        )
+        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+        # the MTP block extends block_count, and this array is read per block. The draft
+        # attends dense, so it takes 0, the same value a non-QSA layer gets.
+        ratios += [0] * (self.block_count - n_layer)
+        self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
         # so emit no PLE keys rather than optional ones
         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
-        if not ple_layers:
+        if not ple_layers or self.mtp_only:
+            # an MTP-only sidecar carries no n-gram table, and the remote tensor
+            # listing is filtered to mtp.*, so the PLE hash constants are absent
             return
         self.gguf_writer.add_ple_layers(ple_layers)
         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
@@ -109,6 +111,45 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if eos is None:
             raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
         return int(eos)
+
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name = item[0]
+        # The MTP block carries its own final hyper-connection mixer. An MTP-only file has
+        # no trunk, so that one becomes the file's mixer; a full model already has the
+        # trunk's, and graph_mtp reads it, so this copy is dropped.
+        if name.startswith("mtp.hyper_connection_mixer."):
+            if cls.no_mtp or not cls.mtp_only:
+                return None
+            return (name.replace("mtp.", "model.", 1), item[1])
+        return super().filter_tensors(item)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+
+        # the reference adds the two MTP input projections, and A*e + B*h == [A|B]*concat(e, h),
+        # so they join into the one eh_proj the tensor map already handles
+        e_name = "mtp.fc_embedding.weight"
+        h_name = "mtp.fc_hidden.weight"
+
+        have_e = e_name in self.model_tensors
+        have_h = h_name in self.model_tensors
+        if not have_e and not have_h:
+            return
+        if not have_e or not have_h:
+            raise KeyError(f"unpaired MTP input projection: need both {e_name} and {h_name}")
+
+        from .base import LazyTorchTensor
+
+        e = LazyTorchTensor.to_eager(self.model_tensors[e_name]())
+        h = LazyTorchTensor.to_eager(self.model_tensors[h_name]())
+        yield (self.format_tensor_name(gguf.MODEL_TENSOR.NEXTN_EH_PROJ,
+                                       self.hparams["num_hidden_layers"]),
+               torch.cat([e, h], dim=1).contiguous())
+
+        del self.model_tensors[e_name]
+        del self.model_tensors[h_name]
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # int64 hash constants must stay exact; 1-D tensors force F32, so use KV
