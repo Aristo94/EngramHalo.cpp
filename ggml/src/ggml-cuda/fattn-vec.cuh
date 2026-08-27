@@ -255,6 +255,24 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        // Each warp works on its own contiguous slice of WARP_SIZE KV rows (KQ, softmax and VKQ alike).
+        // If the mask is -inf for all positions of this warp's slice the slice contributes exactly nothing
+        //     to the final result (exp(-inf) == 0, the running KQ maximum cannot change) and can be skipped.
+        // This is a major optimization for sparse attention (e.g. top-k selection masks) where most of the
+        //     KV cache is masked out for any given Q column.
+        if (mask) {
+            int any_unmasked = 0;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    any_unmasked |= !isinf(__half2float(maskh[j*ne11 + threadIdx.y*WARP_SIZE + threadIdx.x]));
+                }
+            }
+            if (!warp_reduce_any<WARP_SIZE>(any_unmasked)) {
+                continue;
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 
