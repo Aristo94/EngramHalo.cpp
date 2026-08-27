@@ -55,6 +55,13 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // batched readahead hint for scattered rows of a memory-mapped tensor whose pages carry
+    // a random-access advice (TENSOR_READ_LAZY): the kernel does no readahead there, so the
+    // faults are queued here before the gather runs instead of being taken one at a time.
+    // base points at the first row inside a mapping, stride is the byte distance between rows.
+    static void prefetch_rows(const void * base, size_t stride, size_t row_size,
+                              const int32_t * rows, size_t n_rows);
+
     static const bool SUPPORTED;
 
 private:
