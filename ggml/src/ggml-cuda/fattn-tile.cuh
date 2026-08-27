@@ -312,8 +312,19 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     return 0;
 }
 
+// RDNA3.5 (e.g. Strix Halo/gfx1151): same as generic RDNA except for head size 256,
+// where a smaller nbatch_K improves LDS usage/occupancy for the large-batch (prefill) tile shape.
+static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_rdna3_5(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64,  64)
+
+    return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
+}
+
 static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+            return ggml_cuda_fattn_tile_get_config_amd_rdna3_5(DKQ, DV, ncols);
+        }
         if (GGML_CUDA_CC_IS_RDNA(cc)) {
             return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
         }
@@ -327,11 +338,13 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const in
 
 static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols) {
 #ifdef GGML_USE_HIP
-#ifdef RDNA
+#ifdef RDNA3_5
+    return ggml_cuda_fattn_tile_get_config_amd_rdna3_5(DKQ, DV, ncols);
+#elif defined(RDNA)
     return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
 #else
     return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
-#endif // RDNA
+#endif // RDNA3_5
 #else
 #ifdef FAST_FP16_AVAILABLE
     return ggml_cuda_fattn_tile_get_config_nvidia_fp16(DKQ, DV, ncols);
@@ -594,6 +607,39 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #endif // FAST_FP16_AVAILABLE
     static_assert(cpw % KQ_cs == 0, "bad KQ_cs");
     const int k_VKQ_sup = k_VKQ_max - k_VKQ_0; // k supremum, only smaller k values have valid KV data
+
+    // If the mask is -inf for the entire tile the tile contributes exactly nothing to the final result
+    //     (exp(-inf) == 0 and the running KQ maximum cannot change) and can therefore be skipped.
+    // This is a major optimization for sparse attention (e.g. top-k selection masks, SWA-style masks)
+    //     where most of the KV cache is masked out for any given Q column.
+    // The cost is reading ncols1*nbatch_fa mask values per tile which is negligible vs. the K/V loads.
+    if (ncols2 > 1 || mask) {
+        __shared__ int tile_any_unmasked;
+        if (threadIdx.y == 0 && threadIdx.x == 0) {
+            tile_any_unmasked = 0;
+        }
+        __syncthreads();
+
+        int any_unmasked = 0;
+#pragma unroll
+        for (int j0 = 0; j0 < ncols1; ++j0) {
+            const int jm = fastmodulo(col_Q_0 + j0, ne01);
+#pragma unroll
+            for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*warp_size) {
+                const int i = i0 + threadIdx.y*warp_size + threadIdx.x;
+                if ((i0 + nwarps*warp_size <= nbatch_fa || i < nbatch_fa) && (!oob_check || i < k_VKQ_sup)) {
+                    any_unmasked |= !isinf(__half2float(mask[jm*stride_mask + k_VKQ_0 + i]));
+                }
+            }
+        }
+        if (warp_reduce_any<warp_size>(any_unmasked) && threadIdx.x == 0) {
+            tile_any_unmasked = 1;
+        }
+        __syncthreads();
+        if (!tile_any_unmasked) {
+            return;
+        }
+    }
 
     float KQ_max_new[cpw];
 #pragma unroll
