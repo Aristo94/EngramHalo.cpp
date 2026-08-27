@@ -661,6 +661,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (Q->ne[1] <= 2) {
                 return BEST_FATTN_KERNEL_VEC;
             }
+            // For quantized K/V the tile kernel needs to dequantize the entire visible KV cache to FP16
+            //     once per call (O(n_kv), independent of the mask). On RDNA this makes the vector kernel
+            //     preferable also for the small verification batches used in speculative decoding.
+            if (GGML_CUDA_CC_IS_RDNA(cc) && Q->ne[1] <= 8) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
         }
     }
     return BEST_FATTN_KERNEL_TILE;
