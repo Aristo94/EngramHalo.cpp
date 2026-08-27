@@ -691,6 +691,14 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // TENSOR_READ_LAZY tensors whose data lives on the file mapping: their pages carry a
+    // random-access advice, so gathers want an explicit readahead (see prefetch_rows)
+    std::unordered_set<const struct ggml_tensor *> lazy_read_tensors;
+
+    // queue a readahead for the given rows of a lazily-read tensor before the gather runs;
+    // a no-op for tensors that are not lazily read from a mapping
+    void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 

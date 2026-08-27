@@ -398,6 +398,43 @@ public:
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
     }
 
+    // every tensor shape below is a function of (n_tokens, n_stream, idx-cache n_kv, ratio) only,
+    // so matching shapes mean a fresh build would produce the same topology.
+    // blk_bias additionally depends on the KQ mask, whose own reuse llm_graph_input_mem_hybrid checks.
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * mctx_new = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+        mctx = mctx_new;
+
+        const auto * mctx_idx = mctx_new->get_idx();
+        if (mctx_idx == nullptr) {
+            return false;
+        }
+
+        const int64_t n_kv     = mctx_idx->get_n_kv();
+        const int64_t n_stream = mctx_new->get_n_stream();
+        const int64_t r        = ratio;
+        const int64_t n_blocks = (n_kv + r - 1)/r;
+
+        if (n_stream <= 0 || params.ubatch.n_tokens % n_stream != 0) {
+            return false;
+        }
+
+        bool res = true;
+
+        res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
+        res &= cell_blk->ne[0]  == n_kv;
+        res &= cell_blk->ne[1]  == n_stream;
+        res &= blk_cells->ne[0] == r*n_blocks;
+        res &= blk_cells->ne[1] == n_stream;
+        res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
+        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
+        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        res &= bias->ne[2]      == n_stream;
+
+        return res;
+    }
+
     // per stream: a cell index names a different token in each stream
     ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
     ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
@@ -903,6 +940,16 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    // the row tensor only depends on n_tokens; the hash inputs (tokens, history) are
+    // refreshed by set_input from the re-bound attention context on every ubatch
+    bool can_reuse(const llm_graph_params & params) override {
+        const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
+
+        mctx = mctx_hyb->get_attn();
+
+        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
+    }
+
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
 
     const llama_model_qwen4exp & pmodel;
@@ -973,6 +1020,12 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    // the table is far too big to keep resident, so TENSOR_READ_LAZY marks its pages
+    // MADV_RANDOM and the gather reads straight off the mapping: one fault per row, 16 per
+    // token, no two of them on the same page. left to get_rows those faults happen one at a
+    // time; queued here they are all in flight before the graph even runs.
+    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
