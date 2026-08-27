@@ -9740,6 +9740,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
     }
 
+    // wide rows with large k as used by the QSA lightning indexer (qwen4exp, k = top_k + ratio - 1)
+    for (int k : {2051}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2051,   2, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768,  2, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768,  2, 1, 1}, k, true));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {262144, 1, 1, 1}, k));
+    }
+
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
@@ -10478,6 +10486,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // QSA lightning-indexer shapes (qwen4exp): decode is one row over the KV length,
+    // prefill is one row per ubatch token at 16K depth
+    for (auto cols : {16384, 65536, 262144}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, 1, 1, 1}, 2051));
+    }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {18432, 2048, 1, 1}, 2051));
 
     for (auto nrows : {1, 4, 8, 16}) {
         for (auto cols : {128, 1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000, 2000000}) {
