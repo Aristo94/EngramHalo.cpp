@@ -2,18 +2,24 @@
 
 This branch (`strix-halo-qwen4exp`) is the current head of the qwen4exp PR
 ([ggml-org/llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742))
-plus seven commits that make Qwen 3.8 Flash-Next fast on AMD Strix Halo
+plus a small patch series that makes Qwen 3.8 Flash-Next fast on AMD Strix Halo
 (Ryzen AI MAX+ 395 / Radeon 8060S, `gfx1151`, 96 GB unified LPDDR5X).
 
-Measured on one machine, 2026-08-27, UD-IQ3_XXS, q8_0 KV, temperature 0:
+Measured on one machine, 2026-08-27, UD-IQ3_XXS, q8_0 KV, temperature 0.
+The model keeps its 26.8 GiB engram (n-gram) table off the GPU — you choose
+whether it lives on **SSD** (`-lm mmap --tensor-read-lazy on`, ~1.2 GiB
+resident, full 262K context) or in **RAM** (`-lm none`, fastest, ≤~48K):
 
-| | stock config | this branch |
-|---|---|---|
-| decode, code (short ctx) | 23.5 t/s | **39.3 t/s** |
-| decode @ 64K depth (MTP) | 11.0 | **21.3** |
-| decode @ 156K depth (MTP) | ~6 | **12.1** |
-| prefill @ depth 0 | 352 | **496** |
-| prefill @ 131K depth | 91 | **192** |
+| | stock config | this branch, engram on SSD | this branch, engram in RAM |
+|---|---|---|---|
+| decode, code (MTP) | 23.5 t/s | 34.6 | **39.3** |
+| decode @ 64K depth (MTP) | 11.0 | **21.3** | n/a (ctx limit) |
+| decode @ 156K depth (MTP) | ~6 | **12.1** | n/a |
+| prefill @ depth 0 | 352 | 396 | **496** |
+| prefill @ 131K depth | 91 | **192** | n/a |
+| resident engram | 26.8 GiB | **~1.2 GiB** | 26.8 GiB pinned |
+
+Full tables, methodology, and every command: [BENCHMARKS.md](BENCHMARKS.md).
 
 Quality is untouched: wikitext-2 PPL delta of the whole patch set is 0.03%,
 and speculative decoding is lossless at temperature 0.
@@ -86,7 +92,7 @@ python convert_hf_to_gguf.py --remote --mtp Qwen/Qwen3.8-Flash-Next \
 llama-quantize mtp-Qwen3.8-Flash-Next-BF16.gguf mtp-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0
 ```
 
-A prebuilt Q8_0 sidecar is at **[HF-LINK]**. The Q8 sidecar measured *better*
+A prebuilt Q8_0 sidecar is at **https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Sidecar-GGUF**. The Q8 sidecar measured *better*
 than BF16 (half the draft reads, quant-matched errors → higher acceptance),
 and `--spec-draft-p-min 0.75` is what keeps prose from regressing.
 
