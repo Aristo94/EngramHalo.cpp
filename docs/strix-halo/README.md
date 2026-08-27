@@ -19,6 +19,7 @@ resident, full 262K context) or in **RAM** (`-lm none`, fastest, ≤~48K):
 | prefill @ 131K depth | 91 | **192** | n/a |
 | resident engram | 26.8 GiB | **~1.2 GiB** | 26.8 GiB pinned |
 
+IQ4_XS is worth a look: it prefills *faster* than IQ3 (+7-17%), decodes ~7% slower and is 2.5% better in PPL.
 Full tables, methodology, and every command: [BENCHMARKS.md](BENCHMARKS.md).
 
 Quality is untouched: wikitext-2 PPL delta of the whole patch set is 0.03%,
@@ -70,7 +71,7 @@ toolbox run --container llama-strix-qwen4exp \
 `-lm mmap --tensor-read-lazy on -c 262144`. The 51B engram table then stays
 SSD-backed (~1.2 GiB resident instead of 26.8). Do **not** use `--no-mmap` —
 it silently disables the lazy-read path. Note: we validated MTP up to a 164K
-slot; 256K slot + MTP is unverified.
+slot; 256K slot + MTP is unverified. `-lm none` (RAM mode) is short-context only: slots >~48K stall during allocation.
 
 **C — throughput:** config B plus `--parallel 4` with smaller slots
 (≈2.4× aggregate decode at short contexts).
@@ -92,7 +93,7 @@ python convert_hf_to_gguf.py --remote --mtp Qwen/Qwen3.8-Flash-Next \
 llama-quantize mtp-Qwen3.8-Flash-Next-BF16.gguf mtp-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0
 ```
 
-A prebuilt Q8_0 sidecar is at **https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Sidecar-GGUF**. The Q8 sidecar measured *better*
+A prebuilt Q8_0 sidecar is at **https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF**. The Q8 sidecar measured *better*
 than BF16 (half the draft reads, quant-matched errors → higher acceptance),
 and `--spec-draft-p-min 0.75` is what keeps prose from regressing.
 
