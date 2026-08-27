@@ -1379,6 +1379,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         n_created++;
     }
 
+    if (is_lazy) {
+        lazy_tensors.push_back(tensor);
+    }
+
     return tensor;
 }
 
