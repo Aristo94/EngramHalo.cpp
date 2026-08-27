@@ -32,7 +32,7 @@ ENV ROCM_PATH=/opt/rocm \
   LD_LIBRARY_PATH=/opt/rocm/core/lib/rocm_sysdeps/lib:/opt/rocm/core/lib
 
 WORKDIR /opt/llama.cpp
-ARG REPO=https://github.com/Aristo94/llama.cpp.git
+ARG REPO=https://github.com/Aristo94/EngramHalo.cpp.git
 ARG BRANCH=strix-halo-qwen4exp
 RUN git clone -b ${BRANCH} --single-branch --recursive ${REPO} .
 
