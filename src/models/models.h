@@ -2323,6 +2323,19 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        // decode fast path: gather the selected K/V rows and attend over n_sel cells
+        ggml_tensor * build_attn_qsa_gather(
+                    ggml_tensor * k,
+                    ggml_tensor * v,
+                    ggml_tensor * kq_mask,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * top_k,
+                        int64_t   width,
+                          float   kq_scale,
+                            int   il);
+
+        // padded top-k width when the gather path applies to this ubatch, otherwise 0
+        int64_t qsa_gather_n_sel(int64_t n_kv, int64_t width) const;
 
         // QSA: token indices this layer's queries may attend to, or nullptr for dense
         ggml_tensor * build_qsa_top_k(
