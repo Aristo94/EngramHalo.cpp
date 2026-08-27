@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -613,13 +615,180 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    // the decode gather path needs the selection padded to the flash attention KV granularity;
+    // build_attn_qsa_gather masks the extra entries out again, so the visible set stays `width`
+    const int64_t n_sel = std::max<int64_t>(width, qsa_gather_n_sel(n_kv, width));
+
+    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, n_sel));
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
-    top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
+    top_k = ggml_reshape_4d(ctx0, top_k, n_sel, n_tps, 1, n_stream);
     cb(top_k, "indexer_top_k", il);
 
     return top_k;
+}
+
+// Decides whether build_attn_qsa may gather the selected rows instead of masking all n_kv cells.
+// Returns the padded row count for the gathered attention, or 0 to keep the dense path.
+int64_t llama_model_qwen4exp::graph::qsa_gather_n_sel(int64_t n_kv, int64_t width) const {
+    // opt-out / tuning: LLAMA_QSA_GATHER=0 disables the gather, an integer sets the
+    // minimum n_kv it activates at (default 16384; "1" forces it on for testing)
+    static const int64_t min_kv = [] {
+        const char * env = getenv("LLAMA_QSA_GATHER");
+        if (env == nullptr) {
+            return (int64_t) 16384;
+        }
+        const int64_t v = atoll(env);
+        return v <= 0 ? INT64_MAX : v;
+    }();
+
+    // multi-sequence ubatches build correct gather graphs - tests/test-qsa-gather-ms.cpp
+    // pins the packed multiple-choice shapes (coupled prefixes, shrinking mixed tails,
+    // n_stream > 1 joint decodes) against the dense path on the CPU backend. but only
+    // plain single-sequence decode ubatches have been validated end-to-end on the GPU
+    // backends, and the eval tools (llama-perplexity --multiple-choice and friends) are
+    // exactly what produces the other shapes. until the wider envelope has been cleared
+    // on the target hardware, keep the gather to single-sequence ubatches; the ne3-batched
+    // flash attention with one query per slice is untried territory for the fastest kernels.
+    // LLAMA_QSA_GATHER_MS=1 lifts the restriction for validation runs.
+    static const bool allow_multi_seq = [] {
+        const char * env = getenv("LLAMA_QSA_GATHER_MS");
+        return env != nullptr && atoi(env) != 0;
+    }();
+
+    if (!allow_multi_seq && ubatch.n_seqs_unq != 1) {
+        return 0;
+    }
+
+    // the gather relies on flash attention: a non-transposed V cache and an f16 mask.
+    // alibi encodes distances in the mask; the gathered mask stays value-faithful, but the
+    // dense reference path is the only one exercised with it, so do not diverge from it here.
+    if (!cparams.flash_attn || hparams.use_alibi) {
+        return 0;
+    }
+
+    // decode-sized batches only: a prefill ubatch amortizes the dense pass over many queries,
+    // while the gather cost scales with n_tokens (each token gathers its own n_sel rows)
+    if (n_tokens > 16 || n_kv < min_kv) {
+        return 0;
+    }
+
+    // FATTN_KQ_STRIDE: the fastest CUDA/HIP kernels need the KV length padded to 256
+    const int64_t n_sel = GGML_PAD(width, 256);
+
+    // nothing to gain unless the gather actually shrinks the attended range
+    if (n_sel >= n_kv) {
+        return 0;
+    }
+
+    return n_sel;
+}
+
+// Decode fast path for QSA: instead of unmasking the top-k cells inside a dense [n_kv] attention,
+// gather exactly those K/V rows out of the cache and attend over [n_sel] cells. KV bandwidth and
+// attention work per token drop from O(n_kv) to O(n_sel). The result matches the dense path:
+//   - the rows come from the same top_k tensor; entries [width, n_sel) only pad the row count
+//     to the flash attention granularity and are re-masked below
+//   - every gathered row keeps its original visibility: mask_sel[j] = kq_mask[top_k[j]]
+// Each token attends to its own selection, so the tokens ride in ne3 with one query per slice.
+ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gather(
+        ggml_tensor * k,        // [n_embd_head_k, n_head_kv, n_kv, ns] view of the K cache
+        ggml_tensor * v,        // [n_embd_head_v, n_head_kv, n_kv, ns] view of the V cache
+        ggml_tensor * kq_mask,  // F16 [n_kv, n_tps, 1, ns]
+        ggml_tensor * q_cur,    // F32 [n_embd_head_k, n_head, n_tokens]
+        ggml_tensor * top_k,    // I32 [n_sel, n_tps, 1, ns] cell indices, per stream
+        int64_t       width,    // leading entries of top_k that carry the reference selection
+        float         kq_scale,
+        int           il) {
+    const int64_t d_k   = k->ne[0];
+    const int64_t d_v   = v->ne[0];
+    const int64_t hkv   = k->ne[1];
+    const int64_t n_kv  = k->ne[2];
+    const int64_t ns    = k->ne[3];
+
+    const int64_t n_sel = top_k->ne[0];
+    const int64_t n_tps = top_k->ne[1];
+    const int64_t nt    = n_tps*ns;
+
+    GGML_ASSERT(top_k->ne[3] == ns);
+    GGML_ASSERT(nt == q_cur->ne[2]);
+    GGML_ASSERT(width <= n_sel && n_sel <= n_kv);
+    GGML_ASSERT(v->nb[1] <= v->nb[2] && "QSA gather needs a non-transposed V cache");
+    GGML_ASSERT(kq_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(top_k));
+    GGML_ASSERT(ggml_is_contiguous(q_cur));
+
+    // LLAMA_QSA_GATHER_TRACE=1 prints one line per gather graph build - the direct way
+    // to confirm which shapes the gather actually ran with on a given workload.
+    // n_seqs_unq is what the multi-sequence gate decides on, while ns is the KV cache
+    // stream count, which stays 1 on a unified cache however many sequences the ubatch
+    // carries - both are needed to tell a holding gate from a leaking one.
+    static const bool trace = [] {
+        const char * env = getenv("LLAMA_QSA_GATHER_TRACE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (trace) {
+        fprintf(stderr, "qsa-gather: il=%d n_sel=%" PRId64 " n_tps=%" PRId64 " ns=%" PRId64
+                " n_seqs_unq=%" PRIu32 " n_kv=%" PRId64 " width=%" PRId64 "\n",
+                il, n_sel, n_tps, ns, ubatch.n_seqs_unq, n_kv, width);
+    }
+
+    // every stream's indices in one flat list; get_rows picks stream s's cells for row list s
+    ggml_tensor * idx = ggml_view_2d(ctx0, top_k, n_sel*n_tps, ns, top_k->nb[3], 0);
+
+    // a cell is one contiguous row of d*hkv values in the cache, so fold the head dim away
+    ggml_tensor * k_rows = ggml_view_3d(ctx0, k, d_k*hkv, n_kv, ns, k->nb[2], k->nb[3], 0);
+    ggml_tensor * v_rows = ggml_view_3d(ctx0, v, d_v*hkv, n_kv, ns, v->nb[2], v->nb[3], 0);
+
+    // note: get_rows always returns F32; a fused quant->F16 gather would halve this intermediate
+    ggml_tensor * k_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, k_rows, idx), GGML_TYPE_F16);
+    ggml_tensor * v_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, v_rows, idx), GGML_TYPE_F16);
+    cb(k_sel, "qsa_k_sel", il);
+    cb(v_sel, "qsa_v_sel", il);
+
+    // [d*hkv, n_sel*n_tps, ns] -> [d, n_sel, hkv, nt]: token t of stream s is ne3 slice s*n_tps + t,
+    // the same order the ubatch lays its tokens out in
+    ggml_tensor * k_g = ggml_view_4d(ctx0, k_sel, d_k, n_sel, hkv, nt,
+            ggml_row_size(k_sel->type, d_k*hkv),
+            ggml_row_size(k_sel->type, d_k),
+            ggml_row_size(k_sel->type, d_k*hkv*n_sel), 0);
+    ggml_tensor * v_g = ggml_view_4d(ctx0, v_sel, d_v, n_sel, hkv, nt,
+            ggml_row_size(v_sel->type, d_v*hkv),
+            ggml_row_size(v_sel->type, d_v),
+            ggml_row_size(v_sel->type, d_v*hkv*n_sel), 0);
+
+    // per-row visibility: gather each selected cell's original mask value (rows of size 1)
+    ggml_tensor * idx_w  = ggml_view_3d(ctx0, top_k, width, n_tps, ns, top_k->nb[1], top_k->nb[3], 0);
+    ggml_tensor * m_sel  = ggml_get_rows(ctx0,
+            ggml_reshape_4d(ctx0, kq_mask, 1, n_kv, n_tps, ns), idx_w);
+
+    // the entries past `width` only pad n_sel for the kernel: mask them back out
+    if (width < n_sel) {
+        ggml_tensor * m_pad = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_sel - width, n_tps, ns);
+        m_pad = ggml_fill(ctx0, m_pad, -INFINITY);
+        m_sel = ggml_concat(ctx0, m_sel, m_pad, 1);
+    }
+
+    ggml_tensor * m = ggml_cast(ctx0, m_sel, GGML_TYPE_F16);
+    m = ggml_reshape_4d(ctx0, m, n_sel, 1, 1, nt);
+    cb(m, "qsa_kq_mask_sel", il);
+
+    // one query per ne3 slice against that token's own n_sel rows
+    ggml_tensor * q = ggml_reshape_4d(ctx0, q_cur, d_k, 1, q_cur->ne[1], nt);
+
+    ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k_g, v_g, m, kq_scale,
+            hparams.f_max_alibi_bias,
+            hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+
+    // [d_v, n_head, 1, nt] -> [d_v*n_head, n_tokens], token order unchanged
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
 }
 
 // Dense GQA self-attention restricted to the cells that top_k names.
@@ -663,6 +832,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // decode fast path: attend over the gathered top-k rows instead of masking all n_kv cells
+    {
+        const int64_t n_kv  = k->ne[2];
+        const int64_t r     = hparams.dsv4_compress_ratios[il];
+        const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+        // build_qsa_top_k took the same decision, so top_k already has n_sel entries
+        const int64_t n_sel = qsa_gather_n_sel(n_kv, width);
+        if (n_sel > 0) {
+            GGML_ASSERT(top_k->ne[0] == n_sel);
+
+            ggml_tensor * cur = build_attn_qsa_gather(k, v, kq_mask, q_cur, top_k, width, kq_scale, il);
+            cb(cur, "kqv_out", il);
+
+            // the rotation is its own inverse, so undo it on the value side of the output
+            if (inp->self_v_rot) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            }
+
+            return cur;
+        }
+    }
+
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
@@ -689,11 +884,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q_cur, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
