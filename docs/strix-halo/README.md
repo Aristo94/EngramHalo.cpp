@@ -5,23 +5,25 @@ This branch (`strix-halo-qwen4exp`) is the current head of the qwen4exp PR
 plus a small patch series that makes Qwen 3.8 Flash-Next fast on AMD Strix Halo
 (Ryzen AI MAX+ 395 / Radeon 8060S, `gfx1151`, 96 GB unified LPDDR5X).
 
-Measured on one machine, 2026-08-27, UD-IQ3_XXS, q8_0 KV, temperature 0.
-The model keeps its 26.8 GiB engram (n-gram) table off the GPU — you choose
-whether it lives on **SSD** (`-lm mmap --tensor-read-lazy on`, ~1.2 GiB
-resident, full 262K context) or in **RAM** (`-lm none`, fastest, ≤~48K):
+Measured 2026-08-27 on one machine, q8_0 KV, temperature 0. The model keeps
+its 26.8 GiB engram (n-gram) table off the GPU — you choose whether it lives
+on **SSD** (`-lm mmap --tensor-read-lazy on`, ~1.2 GiB resident, full 262K
+context) or in **RAM** (`-lm none`, fastest, short contexts only):
 
-| | stock config | this branch, engram on SSD | this branch, engram in RAM |
-|---|---|---|---|
-| decode, code (MTP) | 23.5 t/s | 34.6 | **39.3** |
-| decode @ 64K depth (MTP) | 11.0 | **21.3** | n/a (ctx limit) |
-| decode @ 156K depth (MTP) | ~6 | **12.1** | n/a |
-| prefill @ depth 0 | 352 | 396 | **496** |
-| prefill @ 131K depth | 91 | **192** | n/a |
-| resident engram | 26.8 GiB | **~1.2 GiB** | 26.8 GiB pinned |
+| q8_0 KV, temp 0 | stock (IQ3) | tuned IQ3, SSD | tuned IQ3, RAM | tuned IQ4_XS, SSD |
+|---|---|---|---|---|
+| tg400 code, MTP @ d0 | 23.5 | 34.6 | **39.3** | 31.1 |
+| tg300 prose, MTP @ d0 | 22.4 | 25.2 | 25.3 | 23.2 |
+| tg300 code, MTP @ d78k | ~10 | 21.3 | — | **24.7** |
+| tg300 code, MTP @ d156k | ~6 | **12.1** | — | 11.4 |
+| pp4096 @ d0 | 352 | 396 | **496** | **~502** |
+| pp @ d131k | 91 | 192 | — | **216** |
+| resident engram | 26.8 GB | **~1.2 GB** | 26.8 GB pinned | ~1.2 GB |
+| max context (single slot) | 262K | **262K** | ~48K | 262K |
 
-IQ4_XS is worth a look: it prefills *faster* than IQ3 (+7-17%), decodes ~7% slower and is 2.5% better in PPL.
-Full tables, methodology, and every command: [BENCHMARKS.md](BENCHMARKS.md).
-
+Notes: stock column = plain decode (MTP did not exist there); `~` values are
+estimates/interpolations from the measured depth curve. Depth rows use
+identical prompts across the tuned columns.
 Quality is untouched: wikitext-2 PPL delta of the whole patch set is 0.03%,
 and speculative decoding is lossless at temperature 0.
 
@@ -71,7 +73,7 @@ toolbox run --container llama-strix-qwen4exp \
 `-lm mmap --tensor-read-lazy on -c 262144`. The 51B engram table then stays
 SSD-backed (~1.2 GiB resident instead of 26.8). Do **not** use `--no-mmap` —
 it silently disables the lazy-read path. Note: we validated MTP up to a 164K
-slot; 256K slot + MTP is unverified. `-lm none` (RAM mode) is short-context only: slots >~48K stall during allocation.
+slot; 256K slot + MTP is unverified. `-lm none` (RAM mode) is short-context only: with slots >~48K the first request deadlocks (reproducible, on the debug list).
 
 **C — throughput:** config B plus `--parallel 4` with smaller slots
 (≈2.4× aggregate decode at short contexts).
