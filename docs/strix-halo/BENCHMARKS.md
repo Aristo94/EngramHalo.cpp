@@ -31,7 +31,7 @@ compete for the same physical 92 GiB pool. This matters for every number below.
   UD-IQ3_XXS (76.32 GiB; 3 shards) and UD-IQ4_XS (87.24 GiB).
   The engram table (`per_layer_token_embd`) is byte-identical in all quants:
   one IQ4_NL tensor, 26.82 GiB, always CPU-side.
-* MTP sidecar: [EasiiX/Qwen3.8-Flash-Next-MTP-Sidecar-GGUF](https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Sidecar-GGUF)
+* MTP sidecar: [EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF](https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF)
   (Q8_0, 4.1 GB), built with this branch's converter.
 
 ## Methodology
@@ -186,6 +186,45 @@ cache squeezed) — use smaller slots for multi-stream.
   decode 24.8/17.9 (@0/@16K) — ROCm with these patches wins everywhere.
   (Vulkan has since gained lightning-indexer kernels upstream; expect that gap
   to move.)
+
+## IQ3_XXS vs IQ4_XS (ENG build)
+
+llama-bench pair, mmap with the engram fully page-cached (q8_0 KV, t4, ub 2048):
+
+| | IQ3_XXS | IQ4_XS |
+|---|---|---|
+| pp4096 @ depth 0 | 468.1 | **501.6** |
+| pp4096 @ 16K | 376.5 | 379.3 |
+| tg128 @ depth 0 | 24.6 | 22.8 |
+| tg128 @ 16K | 21.5 | 20.1 |
+
+Server-measured in true SSD-lazy mode (`--tensor-read-lazy on`):
+
+| | IQ3_XXS | IQ4_XS |
+|---|---|---|
+| pp over a 20.8K prompt | 346.5 | **403.7 (+17%)** |
+| decode @ 20K | 20.3 | 19.2 |
+| decode, short | 24.4 | 22.5 |
+| decode, code, MTP combo | 34.6 | 31.1 |
+| decode, prose, MTP combo | 25.2 | 23.2 |
+
+Surprising but consistent: **IQ4_XS prefills faster than IQ3_XXS** (IQ4 dequant
+is cheaper in the MMQ path than IQ3 sign-unpacking) while paying ~7% decode.
+With its 2.5% better PPL, IQ4_XS is arguably the better default when you can
+spare the 11 GiB — it needs SSD mode for large contexts (60.4 GiB GPU part).
+
+Note on comparing tables: llama-bench mmap numbers have the engram fully
+cached (no lazy reads), which is why they exceed the lazy-mode server numbers
+at depth 0. Both are labeled accordingly.
+
+## RAM mode is a short-context mode
+
+`-lm none` with large slots does not come up: at `-c 98304` and `-c 163840`
+the server stalled in the allocation phase for >15 minutes (twice, with and
+without the MTP sidecar) before we killed it. At `-c 32768` it loads in
+minutes and delivers the best short-context numbers. You lose nothing: at
+16K depth both modes are already equal (KV/indexer-bound), so SSD-lazy is
+both the only and the lossless option for long contexts.
 
 ## Raw data
 
