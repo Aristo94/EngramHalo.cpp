@@ -217,14 +217,18 @@ Note on comparing tables: llama-bench mmap numbers have the engram fully
 cached (no lazy reads), which is why they exceed the lazy-mode server numbers
 at depth 0. Both are labeled accordingly.
 
-## RAM mode is a short-context mode
+## RAM mode is a short-context mode (known bug with large slots)
 
-`-lm none` with large slots does not come up: at `-c 98304` and `-c 163840`
-the server stalled in the allocation phase for >15 minutes (twice, with and
-without the MTP sidecar) before we killed it. At `-c 32768` it loads in
-minutes and delivers the best short-context numbers. You lose nothing: at
-16K depth both modes are already equal (KV/indexer-bound), so SSD-lazy is
-both the only and the lossless option for long contexts.
+`-lm none` with large slots reproducibly deadlocks on the **first task**:
+the server becomes healthy, but the first request sits at
+`n_prompt_tokens_processed: 0` with the GPU idle, indefinitely. Reproduced
+three times (`-c 98304`, `-c 143360`, `-c 163840`; with and without the MTP
+sidecar; once on a freshly rebooted, otherwise idle box). `-c 32768` works
+flawlessly and delivers the best short-context numbers. Prime suspect is the
+pinned-host compute-buffer path (the #25992 iGPU workaround) with the large
+QSA buffers — on the debug list. You lose nothing meanwhile: at 16K depth
+both modes are already equal (KV/indexer-bound), so SSD-lazy is both the
+only and the lossless option for long contexts.
 
 ## Raw data
 
