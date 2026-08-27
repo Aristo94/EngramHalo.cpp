@@ -117,6 +117,10 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // lazy tensors in creation order, so the model can prefetch their rows at runtime
+    std::vector<const ggml_tensor *> lazy_tensors;
+
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
