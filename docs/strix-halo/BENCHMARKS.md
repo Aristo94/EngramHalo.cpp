@@ -207,6 +207,9 @@ Server-measured in true SSD-lazy mode (`--tensor-read-lazy on`):
 | decode, short | 24.4 | 22.5 |
 | decode, code, MTP combo | 34.6 | 31.1 |
 | decode, prose, MTP combo | 25.2 | 23.2 |
+| decode @ 78K depth, MTP (identical prompt) | 21.3 | **24.7** |
+| decode @ 156K depth, MTP (identical prompt) | **12.1** | 11.4 |
+| prefill, average over the 156K prompt | 192.3 | **215.6** |
 
 Surprising but consistent: **IQ4_XS prefills faster than IQ3_XXS** (IQ4 dequant
 is cheaper in the MMQ path than IQ3 sign-unpacking) while paying ~7% decode.
