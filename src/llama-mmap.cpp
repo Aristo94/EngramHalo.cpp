@@ -671,6 +671,75 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
+void llama_mmap::prefetch_rows(const void * base, size_t stride, size_t row_size,
+                               const int32_t * rows, size_t n_rows) {
+#if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
+    if (base == nullptr || rows == nullptr || n_rows == 0 || row_size == 0) {
+        return;
+    }
+
+#if defined(_POSIX_MAPPED_FILES)
+    static const size_t page_size = sysconf(_SC_PAGESIZE);
+#else
+    static const size_t page_size = [] {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        return (size_t) si.dwPageSize;
+    }();
+#endif
+
+    // page-align each row and merge rows that fall onto the same or adjacent pages,
+    // so a hint is issued once per distinct page range
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+    ranges.reserve(n_rows);
+    for (size_t i = 0; i < n_rows; ++i) {
+        const uintptr_t row = (uintptr_t) base + (size_t) (uint32_t) rows[i]*stride;
+        const uintptr_t beg =  row             & ~(uintptr_t)(page_size - 1);
+        const uintptr_t end = (row + row_size + page_size - 1) & ~(uintptr_t)(page_size - 1);
+        ranges.emplace_back(beg, end);
+    }
+    std::sort(ranges.begin(), ranges.end());
+
+    size_t n_merged = 0;
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        if (ranges[i].first <= ranges[n_merged].second) {
+            ranges[n_merged].second = std::max(ranges[n_merged].second, ranges[i].second);
+        } else {
+            ranges[++n_merged] = ranges[i];
+        }
+    }
+    ranges.resize(n_merged + 1);
+
+#if defined(_POSIX_MAPPED_FILES)
+    for (const auto & [beg, end] : ranges) {
+        // deliberately unchecked: this is a hint issued for every ubatch, and a failed
+        // hint only costs the page fault it would have avoided
+        posix_madvise((void *) beg, end - beg, POSIX_MADV_WILLNEED);
+    }
+#else
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+
+    BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
+
+    if (pPrefetchVirtualMemory) {
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> entries(ranges.size());
+        for (size_t i = 0; i < ranges.size(); ++i) {
+            entries[i].VirtualAddress = (void *) ranges[i].first;
+            entries[i].NumberOfBytes  = (SIZE_T) (ranges[i].second - ranges[i].first);
+        }
+        pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0);
+    }
+#endif
+#else
+    GGML_UNUSED(base);
+    GGML_UNUSED(stride);
+    GGML_UNUSED(row_size);
+    GGML_UNUSED(rows);
+    GGML_UNUSED(n_rows);
+#endif // defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
+}
+
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
 #else

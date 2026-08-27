@@ -1047,6 +1047,12 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    // the table is far too big to keep resident, so TENSOR_READ_LAZY marks its pages
+    // MADV_RANDOM and the gather reads straight off the mapping: one fault per row, 16 per
+    // token, no two of them on the same page. left to get_rows those faults happen one at a
+    // time; queued here they are all in flight before the graph even runs.
+    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 

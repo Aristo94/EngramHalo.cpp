@@ -95,6 +95,9 @@ struct llama_model_loader {
     // byte ranges of TENSOR_READ_LAZY tensors, per file index
     std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
 
+    // the tensors those ranges belong to, so the model can prefetch their rows at runtime
+    std::vector<const ggml_tensor *> lazy_tensors;
+
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;

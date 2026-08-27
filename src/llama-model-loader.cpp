@@ -1287,12 +1287,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
+    bool read_lazy = false;
     if ((flags & TENSOR_READ_LAZY) && use_mmap && lazy_mode != LLAMA_LAZY_MODE_OFF) {
         // in auto mode, small tensors are cheap enough to keep resident
         constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
         if (lazy_mode == LLAMA_LAZY_MODE_ON || ggml_nbytes(cur) > auto_lazy_min_size) {
             const auto & w = require_weight(tn.str().c_str());
             lazy_tensor_ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(cur));
+            read_lazy = true;
 
             LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
                     __func__, tn.str().c_str(), ggml_nbytes(cur)/1024/1024);
@@ -1339,6 +1341,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         size_data += ggml_nbytes(&t_meta);
     } else {
         n_created++;
+    }
+
+    if (read_lazy) {
+        lazy_tensors.push_back(tensor);
     }
 
     return tensor;
