@@ -1,9 +1,19 @@
 # Qwen 3.8 Flash-Next on AMD Strix Halo — tuned llama.cpp branch
 
-This branch (`strix-halo-qwen4exp`) is the current head of the qwen4exp PR
-([ggml-org/llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742))
+This branch (`strix-halo-qwen4exp`) sits on the qwen4exp PR
+([ggml-org/llama.cpp#27742](https://github.com/ggml-org/llama.cpp/pull/27742),
+merged upstream on 2026-08-27 — a rebase onto master is in progress)
 plus a small patch series that makes Qwen 3.8 Flash-Next fast on AMD Strix Halo
 (Ryzen AI MAX+ 395 / Radeon 8060S, `gfx1151`, 96 GB unified LPDDR5X).
+
+**Backend scope: ROCm/HIP only.** Everything here is tuned and validated on
+ROCm/HIP (`gfx1151`). On Vulkan/RADV this branch is a net loss: a community
+measurement (2026-08-28, Strix Halo, RADV, UD-IQ4_XS, q8_0 KV) saw short-prompt
+prefill drop to roughly half of a stock build and the MTP path collapse to
+6–7 t/s decode. The same test showed that porting just the MTP graph commits
+onto a Vulkan-tuned base keeps stock prefill and gains 26–35% decode with MTP —
+so on Vulkan, start from a stock or Vulkan-tuned build and cherry-pick the MTP
+graph commits instead of using this branch as-is.
 
 Measured 2026-08-27 on one machine, q8_0 KV, temperature 0. The model keeps
 its 26.8 GiB engram (n-gram) table off the GPU — you choose whether it lives
@@ -35,7 +45,7 @@ and speculative decoding is lossless at temperature 0.
 | `HIP: tune FA path for head-dim 256…` | Kernel selection for the qwen4exp attention shape (hd 256, GQA 2, q8_0 KV). |
 | `HIP: chunked GATED_DELTA_NET prefill` | The GDN prefill kernel was token-serial (36 of 48 layers). Opt-in chunked kernel. |
 | `qwen4exp: reuse decode graphs…` | No more full rebuild of the ~5k-node graph every token. |
-| `qwen4exp: gather top-k KV rows…` | QSA "sparse" attention actually ran dense with a mask — full KV bandwidth at any depth. Decode now gathers the 2048 selected rows. Env-gated (`LLAMA_QSA_GATHER`, default on from 16K context; multi-sequence batches stay on the masked path unless `LLAMA_QSA_GATHER_MS=1`). |
+| `qwen4exp: gather top-k KV rows…` | QSA "sparse" attention actually ran dense with a mask — full KV bandwidth at any depth. Decode now gathers the 2048 selected rows. Env-gated: `LLAMA_QSA_GATHER=0` disables it, an integer sets the activation threshold (default on from 16K context). Caveat: multi-sequence ubatches (`--parallel > 1`) currently take the gather path too, and that combination is not separately validated on HIP — set `LLAMA_QSA_GATHER=0` for multi-slot serving until the multi-sequence gate lands. |
 | `qwen4exp: MTP draft head…` | Multi-token prediction with the draft weights from the official checkpoint. Reference design: [#27739](https://github.com/ggml-org/llama.cpp/pull/27739). |
 | `convert: export the qwen4exp MTP block` | Lets you build the MTP sidecar GGUF yourself (see below). |
 
