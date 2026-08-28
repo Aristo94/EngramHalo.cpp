@@ -225,7 +225,20 @@ gather) ·
 on AMD RDNA; enables gfx1151 in code, measured on RDNA4 only) ·
 [#27836](https://github.com/ggml-org/llama.cpp/pull/27836) (qwen4exp MTP as a
 trailing block in the target GGUF — the upstream follow-up path; this branch
-uses a standalone sidecar instead).
+uses a standalone sidecar instead) ·
+Nathan Wilson's [strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-llamacpp)
+(a Vulkan/RADV-first stack for the same GPU — FA dequant-once (#25494), f16 KV
+contiguize, mul_mat_id row-lists, and an independently developed qwen4exp
+NextN/MTP loader and draft graph following the deepseek4/deepseek32 pattern;
+backend-disjoint from this ROCm/HIP-only branch) ·
+Unsloth's `LLAMA_MMAP_RANDOM` batched page prefetch (independent
+implementation of the same row-prefetch technique behind the SSD-resident
+engram table, reached on the #27742 follow-up branch on 2026-08-27; this
+branch drives it from upstream's `TENSOR_READ_LAZY` (#27794) instead) ·
+adjacent RDNA 3.5 `ggml-cuda` work by Gaetan Puleo (gated-delta-net tuning,
+tiled FA, MMVQ Q8_1 caching) and Nathan Wilson (tile dequant-on-load for
+quantized-KV decode) — neighbouring ground to the HIP kernels here, developed
+independently.
 
 Model license: [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE)
 (distribution permitted with notice; prominent model-name display above 100M
