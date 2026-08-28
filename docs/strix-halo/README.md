@@ -114,28 +114,56 @@ The variable is a threshold in `n_kv`, not an on/off switch — `LLAMA_QSA_GATHE
 would force it on from ~2.3K rows upward, a working point none of the numbers
 here cover; `0` turns it off.
 
-**B — long context (up to 262144):** replace `-lm none -c 32768` with
-`-lm mmap --tensor-read-lazy on -c 262144`. The 51B engram table then stays
-SSD-backed (~1 GiB resident instead of 26.8 GiB). `--tensor-read-lazy` is
-already `auto` by default and `auto` covers this tensor (every lazy-marked
+**B — long context (up to 262144, engram on SSD):**
+
+```bash
+toolbox run --container engramhalo \
+  env ROCBLAS_USE_HIPBLASLT=1 \
+  llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
+  -ngl 999 -fa on -ctk q8_0 -ctv q8_0 \
+  -lm mmap --tensor-read-lazy on -c 262144 -b 8192 -ub 2048 -t 4 \
+  --parallel 1 --jinja --no-webui \
+  -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf \
+  --spec-type draft-mtp,ngram-mod --spec-draft-n-max 4 --spec-draft-p-min 0.75
+  # With the MTP sidecar, prefer -c 163840: MTP is validated up to a 164K
+  # slot, a 256K slot + MTP was never run. Without -md, the full -c 262144
+  # is measured and fine.
+```
+
+The only change against A is the load mode: `-lm mmap --tensor-read-lazy on`
+with the big context instead of `-lm none -c 32768`. The 51B engram table then
+stays SSD-backed (~1 GiB resident instead of 26.8 GiB). `--tensor-read-lazy`
+is already `auto` by default and `auto` covers this tensor (every lazy-marked
 tensor above 4 GiB), so `on` only makes the intent explicit — the switch that
 actually matters is mmap vs. no mmap. Do **not** use `--no-mmap`: it silently
-disables the lazy-read path. Note: we validated MTP up to a 164K slot;
-256K slot + MTP was never run. `-lm none` (RAM mode) is short-context only:
+disables the lazy-read path. `-lm none` (RAM mode) is short-context only:
 with large slots the first request deadlocks (reproduced with `-c 143360` and
 `-c 163840`; `-c 32768` runs cleanly, nothing between 32K and 98K was tested).
 The ~48K boundary in the table above is a memory/practice estimate, not a
 measured deadlock threshold.
 
-**C — throughput:** config B plus `--parallel 4` with smaller slots. Nothing
-needs to be set for the gather here: multi-slot decode produces multi-sequence
-ubatches, and those take the masked path by default (see the commit table
-above). Multi-slot serving on gfx1151 does require the #25992 host-buffer
-workaround (upstream PR #25863, still unmerged); `Dockerfile.rocm-7.14`
-applies it. Without it, `--parallel > 1` can return other requests' responses
-verbatim. The ≈2.4× aggregate decode at short contexts was measured pre-patch
-on the stock build — expect at least the same, it has not been re-measured
-here.
+**C — throughput (multiple slots):**
+
+```bash
+toolbox run --container engramhalo \
+  env ROCBLAS_USE_HIPBLASLT=1 \
+  llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
+  -ngl 999 -fa on -ctk q8_0 -ctv q8_0 \
+  -lm mmap --tensor-read-lazy on -c 131072 -b 8192 -ub 2048 -t 4 \
+  --parallel 4 --jinja --no-webui
+  # -c is the TOTAL context: 131072 / 4 slots = 32K per slot; scale to taste.
+  # No MTP sidecar here: multi-slot + speculative decoding is not validated
+  # on this arch.
+```
+
+Nothing needs to be set for the gather here: multi-slot decode produces
+multi-sequence ubatches, and those take the masked path by default (see the
+commit table above). Multi-slot serving on gfx1151 does require the #25992
+host-buffer workaround (upstream PR #25863, still unmerged);
+`Dockerfile.rocm-7.14` applies it. Without it, `--parallel > 1` can return
+other requests' responses verbatim. The ≈2.4× aggregate decode at short
+contexts was measured pre-patch on the stock build — expect at least the
+same, it has not been re-measured here.
 
 Rules of thumb that cost nothing:
 * never use bf16 KV cache (the hd-256 FA path re-converts the whole cache
