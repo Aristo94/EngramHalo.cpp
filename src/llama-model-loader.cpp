@@ -10,9 +10,14 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
+
+#ifdef __linux__
+#include <fcntl.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1504,6 +1509,67 @@ bool llama_model_loader::load_all_data(
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
+    // drop the file pages behind tensors that have already been copied into their backend
+    // buffer. Without this the transient peak of a load is the model size in the destination
+    // buffers *plus* the same bytes once more in the page cache, which on unified memory comes
+    // out of the very same pool and can push a large model over the edge.
+    // Only the copy paths below feed this: a tensor that stays aliased on the mapping (host
+    // buffers, TENSOR_READ_LAZY tables read on demand) is never dropped, and with mmap and
+    // check_tensors the mapping is kept whole because the validation threads still read from
+    // it after the loop.
+    // 0 = off, 1 = unmap only, 2 = unmap and invalidate the page cache (default).
+    static const int drop_behind_mode = [] {
+        const char * env = getenv("LLAMA_MMAP_DROP_BEHIND");
+        return env ? atoi(env) : 2;
+    }();
+    const bool drop_behind = drop_behind_mode > 0 && (!use_mmap || !check_tensors);
+
+    // pending drop range per file, [first, last); flushed once it exceeds drop_behind_batch
+    std::map<uint32_t, std::pair<size_t, size_t>> drop_range;
+    constexpr size_t drop_behind_batch = 1 * 1024 * 1024 * 1024;
+    // ranges are only merged across a gap smaller than the smallest possible page, so that a
+    // tensor that must stay mapped can never be covered by a merge (unmap_fragment itself only
+    // ever releases whole pages that lie inside the range)
+    constexpr size_t drop_behind_gap = 4096;
+
+    auto drop_flush = [&](uint32_t idx) {
+        auto it = drop_range.find(idx);
+        if (it == drop_range.end()) {
+            return;
+        }
+        const size_t first = it->second.first;
+        const size_t last  = it->second.second;
+        drop_range.erase(it);
+
+        if (use_mmap) {
+            mappings.at(idx)->unmap_fragment(first, last);
+        }
+#if defined(POSIX_FADV_DONTNEED)
+        if (drop_behind_mode >= 2) {
+            // with mmap this is only effective now that the range is no longer mapped here
+            posix_fadvise(files.at(idx)->file_id(), first, last - first, POSIX_FADV_DONTNEED);
+        }
+#endif
+        LLAMA_LOG_DEBUG("load_all_data: dropped %.2f MiB of file %u behind the load\n",
+                (last - first) / (double) MiB, idx);
+    };
+
+    auto drop_add = [&](uint32_t idx, size_t first, size_t last) {
+        const auto it = drop_range.find(idx);
+        if (it != drop_range.end()) {
+            if (first >= it->second.second && first - it->second.second < drop_behind_gap) {
+                it->second.second = last;
+                if (it->second.second - it->second.first >= drop_behind_batch) {
+                    drop_flush(idx);
+                }
+                return;
+            }
+            // not contiguous with what is pending: release that range and start over
+            drop_flush(idx);
+        }
+        drop_range[idx] = { first, last };
+    };
+
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
     constexpr size_t n_buffers = 4;
@@ -1648,6 +1714,10 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                // the tensor now lives in its backend buffer, the file pages are dead weight
+                if (drop_behind) {
+                    drop_add(weight->idx, weight->offs, weight->offs + n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1724,9 +1794,30 @@ bool llama_model_loader::load_all_data(
                     }
                 }
             }
+
+            // read into its destination, so the page cache copy of the range is dead weight too.
+            // A range is only ever released once the whole tensor has been read: releasing it in
+            // chunks while a multi-GiB tensor is still being read measured 45x slower prompt
+            // processing afterwards, because it takes the page cache away as reclaim reservoir
+            // exactly while that much anonymous memory is being committed, and the kernel swaps
+            // out the tensor that was just read instead.
+            if (drop_behind) {
+                drop_add(weight->idx, weight->offs, weight->offs + n_size);
+            }
         }
 
+        // the load phase is silent for minutes on a large model, report every 8 GiB
+        constexpr size_t log_step = 8 * GiB;
+        const size_t size_prev = size_done;
         size_done += n_size;
+        if (size_done / log_step != size_prev / log_step) {
+            LLAMA_LOG_INFO("%s: %.1f GiB / %.1f GiB\n", __func__,
+                    size_done / (double) GiB, size_data / (double) GiB);
+        }
+    }
+
+    while (!drop_range.empty()) {
+        drop_flush(drop_range.begin()->first);
     }
 
     // free temporary resources used for async uploads
