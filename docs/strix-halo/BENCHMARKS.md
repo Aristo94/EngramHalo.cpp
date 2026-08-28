@@ -20,9 +20,10 @@ compete for the same physical 92 GiB pool. This matters for every number below.
 
 ## Software
 
-* Branch: this repo, `strix-halo-qwen4exp` = ggml-org/llama.cpp
-  [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742) head
-  `af1ffaf37` + the commits of this branch.
+* Branch base: commit `af1ffaf37` of ggml-org/llama.cpp
+  [PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742) — the PR head
+  at measurement time on 2026-08-27; the PR was merged later that day as
+  `6c84c7d5` — plus the commits of this branch.
 * Reference builds measured against: PR-branch commits `b8bdf73bb`
   (build 10678, "stock" starting point) and `243914706` (build 10695).
 * ROCm 7.14 (`amdrocm-runtime7.14`, `amdrocm-blas7.14-gfx1151`),
@@ -50,14 +51,17 @@ compete for the same physical 92 GiB pool. This matters for every number below.
   Never overlap container builds with measurements (we lost a run to the OOM
   killer that way).
 * One variable per run, against a named anchor.
+* The chunked GDN prefill kernel is opt-in on RDNA3/RDNA4 via
+  `GGML_HIP_GDN_CHUNK=1` and was **not** enabled in any run below.
 
 ### Measurement pitfalls (you will hit these)
 
 * **Cold-start reads low:** the first request after server/model load measures
-  20–40% slow. Do a warm-up request first.
-* **Repeats read high:** sending the identical request again measures ~50%
-  fast (prompt cache + the ngram speculator has seen the answer: 52.7 vs 39.3
-  t/s in our tests). Always use a fresh prompt for the measured run.
+  20–55% slow (worst case observed: 17.8 vs 39.3 t/s right after a full
+  `-lm none` load). Do a warm-up request first.
+* **Repeats read high:** sending the identical request again measures up to
+  ~35% fast (prompt cache + the ngram speculator has seen the answer: 52.7 vs
+  39.3 t/s in our tests). Always use a fresh prompt for the measured run.
 * PPL with 32K chunks OOMs on larger quants (logits buffer × 248,320 vocab ≈
   32 GiB fp32) — use 8K chunks.
 * `llama-perplexity --multiple-choice` crashes on every build of the qwen4exp
@@ -67,34 +71,70 @@ compete for the same physical 92 GiB pool. This matters for every number below.
 
 The model carries 51B parameters of n-gram ("engram") lookup tables — a single
 26.82 GiB tensor that is only ever gathered by input-token id. llama.cpp can
-either keep it **SSD-backed** (`-lm mmap --tensor-read-lazy on`, ~1.2 GiB
-resident) or **fully resident** (`-lm none`; with the #25992 host-buffer
-workaround the gathers then run zero-copy on the iGPU).
+either keep it **SSD-backed** (mmap load plus the lazy tensor read, ~1 GiB
+resident) or **fully resident** (`-lm none`). The container applies two loader
+and backend workarounds on top of the branch:
 
-ENG build (all patches), IQ3_XXS, q8_0 KV, ub 2048, `ROCBLAS_USE_HIPBLASLT=1`:
+* the iGPU host-buffer workaround for llama.cpp issue
+  [#25992](https://github.com/ggml-org/llama.cpp/issues/25992), based on the
+  still-open PR [#25863](https://github.com/ggml-org/llama.cpp/pull/25863): it
+  disables ROCm host-buffer compute on integrated GPUs. That is a correctness
+  workaround for the multi-slot response mix-up reported in #25992; it also
+  determines where the engram gathers end up being scheduled.
+* a per-buffer mmap loader patch: it tracks per shard buffer whether that
+  buffer is mmap-backed, drops the blanket `use_mmap` bail-out from the async
+  upload path and stops the loader from prefetching every byte of every shard.
+  This is what lets the sparse engram tensor stay mmap-backed on the CPU while
+  the dense weights are uploaded to the GPU.
 
-| | engram on SSD (`mmap + tensor-read-lazy`) | engram in RAM (`-lm none`) |
+> **Note:** both workaround patches were part of the builds these numbers were
+> measured on. The published `Dockerfile.rocm-7.14` now ships both and applies
+> each one only for as long as it still fits the tree, so a container built
+> from it reproduces the measured configuration. An earlier revision of this
+> file described the #25992 patch as a "zero-copy" optimization; that
+> mislabelled the mechanism (it is a correctness workaround that moves work off
+> the host buffer) and has been corrected.
+
+ENG build (all patches), IQ3_XXS, q8_0 KV, ub 2048, `ROCBLAS_USE_HIPBLASLT=1`.
+The first four rows are `llama-bench` on both sides — same tool, same metric:
+
+| | engram on SSD (mmap) [a] | engram in RAM (`-lm none`) |
 |---|---|---|
-| prefill @ depth 0 | 395.6 t/s | **495.7 t/s** |
-| prefill @ 16K | 381.9 | 376.9 |
-| decode @ depth 0 | 22.6 | **24.7** |
-| decode @ 16K | 21.0 | 21.5 |
-| decode, code, MTP combo | 34.6 | **39.3** |
-| decode, prose, MTP combo | 25.2 | 25.3 |
-| resident engram footprint | **~1.2 GiB** | 26.8 GiB (pinned) |
+| pp4096 @ depth 0 | 468.1 t/s | **491.4 t/s** |
+| pp4096 @ 16K | 376.5 | 376.9 [b] |
+| tg128 @ depth 0 | 24.6 | **24.7** |
+| tg128 @ 16K | 21.5 | 21.4 [b] |
+| decode, code, MTP combo (server) | 35.3 | **39.3** |
+| decode, prose, MTP combo (server) | 25.1 | 25.3 |
+| resident engram footprint | **~1 GiB** [c] | 26.8 GiB (pinned) |
 | max practical context (single slot, with MTP sidecar) | **262144** (164K validated with MTP) | ~48K |
 | load time | seconds (mmap) | minutes (full read + pinning) |
-| CPU thread sensitivity | `-t 4` best (CPU-side gathers) | none (t4 ≈ t16; gathers on GPU) |
+| CPU thread sensitivity | `-t 4` best (CPU-side gathers) | low (t4 ≈ t16) |
+
+* **[a]** The mmap rows have the engram fully in the page cache. The lazy-read
+  path is active there as well; its reads are simply cache hits.
+* **[b]** From the `-t 16` run; the other `llama-bench` rows are `-t 4`.
+* **[c]** Estimate, not measured on this machine — expect ~1–1.5 GiB. A DGX
+  Spark field report gives 1.4 GiB RSS with the 26.8 GiB table on NVMe.
+
+In true SSD-lazy server operation (the table is read from SSD as it is used,
+page cache not pre-warmed) the same build delivers 395.6 t/s prefill and
+22.6 t/s decode at 4K depth, 381.9 / 21.0 at 16K. Those are depth-curve delta
+rates, a different metric from `llama-bench` `pp4096` — do not compare them
+against the table above.
 
 **Rule of thumb:** RAM mode for interactive/agent work at ≤48K; SSD mode when
 you want the full 262K window, the IQ4_XS quant, or memory headroom for other
-services. The SSD mode costs ~10% short-context throughput and nothing at depth.
+services. Like-for-like, SSD mode costs ~5% prefill at depth 0 and nothing on
+decode; the true lazy-read server numbers are lower because the table is read
+from SSD as it is used.
 
 ## Depth curves (before / after the patches)
 
 Both curves: same method, same flags (IQ3, q8_0 KV, t4, ub 2048, hipBLASLt),
-SSD mode. "Before" = PR branch `243914706` + graph-reuse only. "After" = this
-branch.
+SSD mode. "Before" = PR branch `243914706` plus the graph-reuse commit — which
+also carries the engram row prefetch and the IQ4_NL `get_rows` path, so those
+two are already in the baseline. "After" = this branch.
 
 | depth (tokens) | pp before | pp after | decode before | decode after |
 |---|---|---|---|---|
@@ -137,30 +177,52 @@ pp 328.7 → 390.6 (ub 1024) → **401.7** (ub 2048) @depth 0;
 
 ## Speculation (MTP)
 
-Server, 32K slot, temperature 0, IQ3 target:
+Server, 32K slot, temperature 0, IQ3 target. Rows 1–4 were measured on the
+MTP-port image (`af1ffaf37` + the MTP commits only, without the kernel and
+gather patches), which is why they isolate the speculation effect; rows 5–7
+are the full patch set. In the full build the recommended combo reads 35.3
+code / 25.1 prose.
+
+**Provenance note (2026-08-28):** the campaign binaries behind this table
+predate the qwen4exp MTP head shipped in this branch — the sidecar ran through
+the draft path of that day's PR-branch state. The head as shipped here first
+went through an acceptance run on 2026-08-28; its first request crashed (an
+output-masking bug in the unmasked nextn readback, fixed inside the MTP
+commit), after which it reads code 34.3 t/s at 79.6% acceptance and prose
+22.2 t/s at 63.9% (32K slot, Q8_0 sidecar, temperature 0; plain baseline in
+the same build: 24.4 t/s). Plain mainline master cannot load the sidecar at
+all until an upstream follow-up (#27836 or equivalent) lands.
 
 | decode t/s | code | prose | acceptance C/P |
 |---|---|---|---|
-| plain | 23.3 | 22.4 | — |
+| plain (MTP image) | 23.3 | 22.4 | — |
 | BF16 sidecar, n-max 4 | 30.8 | 17.5 | 84% / 38% |
 | Q8 sidecar, n-max 4, p-min 0.75 | **35.7** | 23.5 | 92% / 70% |
 | Q8 + `draft-mtp,ngram-mod` (recommended) | 34.6 | **25.2** | 80% / 74% |
-| ... + `-lm none` (RAM mode), steady state | **39.3** | 25.3 | 83% / — |
-| ... @64K depth (SSD mode) | **21.3** (plain: 12.9) | — | 70% |
+| ... + `-lm none` (RAM mode), full build, steady state | **39.3** | 25.3 | 83% / — |
+| ... @78K depth, 77,669 tokens (SSD mode) | **21.3** (plain: 12.9) | — | 70% |
 | ... @156K depth (SSD mode) | **12.1** (plain: ~8.1) | — | 76% |
 
 Lessons: the Q8 sidecar beats BF16 (half the draft reads; quant-matched errors
 → higher acceptance). `--spec-draft-p-min 0.75` is what saves prose. A classic
 external 0.8B draft model was measured useless on this architecture (expert
-traffic scales with draft depth). `ngram-mod` alone: code 24.7 → 27.8.
-Speculation is lossless at temperature 0.
+traffic scales with draft depth). `ngram-mod` alone: code 24.7 → 27.8
+(canreuse build, 32K slot; the plain anchor there was 24.7, not the 23.3 of
+the table above).
 
-Note: we validated MTP up to a 164K slot. A 256K slot + MTP hung once under
-(admittedly self-inflicted) memory pressure and is unverified on a clean box.
+On losslessness: the target verifies every drafted token, so at temperature 0
+the accepted sequence is the greedy sequence, up to floating-point
+nondeterminism from batched verification. Not separately measured — there is
+no output diff or logit comparison with the draft head enabled.
+
+Note: MTP was validated up to a 163,840-token slot (SSD mode). A 98K slot in
+RAM mode with the sidecar did not fit (92/92 GiB, thrash). 256K + MTP was
+never run.
 
 ## Multi-slot throughput
 
-`llama-batched-bench`, IQ3, q8, npp 2048, ntg 64:
+`llama-batched-bench` on the **stock build `b8bdf73bb`**, IQ3, q8, `-ub 512`,
+`-c 16384`, npp 2048, ntg 64 — not re-measured on this branch:
 
 | parallel | pp aggregate | decode aggregate | per stream |
 |---|---|---|---|
@@ -173,15 +235,31 @@ Full-context fit: IQ4_XS @262144/1 slot loads to 71.1 GiB GTT and runs.
 IQ3 @4×262144 fits memory-wise (73.8 GiB GTT) but decode collapses (engram
 cache squeezed) — use smaller slots for multi-stream.
 
+**Correctness caveat for multi-slot on gfx1151:** `-np > 1` with `--kv-unified`
+is exactly the configuration of llama.cpp issue
+[#25992](https://github.com/ggml-org/llama.cpp/issues/25992) — requests can
+receive other requests' responses verbatim. The fix (PR
+[#25863](https://github.com/ggml-org/llama.cpp/pull/25863)) is still unmerged
+upstream and is **not** in this tree; `Dockerfile.rocm-7.14` applies it at
+build time. If you build this branch outside that container, do not run
+multi-slot. The QSA gather needs no attention here: multi-sequence ubatches
+take the masked path by default, so multi-slot serving never enters the
+gather unless `LLAMA_QSA_GATHER_MS=1` is set.
+
 ## Quality
 
 * Wikitext-2 PPL, 16×8K chunks, identical conditions:
   IQ3_XXS **4.1466 ± 0.035** vs IQ4_XS **4.0430 ± 0.034** (IQ4 −2.5%, costs
-  8–11% decode).
-* Whole patch set (gather vs dense mask, 4×32K chunks, identical text):
-  4.4601 vs 4.4613 → **Δ 0.03%**. Top-1 logits identical at 20K depth
-  (Δ logprob 0.0009); a dedicated gather-vs-dense regression test pins
-  NMSE ≤ 4.4e-14.
+  8–11% decode on the stock build; ~7% with these patches, see the IQ3/IQ4
+  matrix below).
+* **QSA gather vs. dense mask**, same build, env-gate A/B (4×32K chunks,
+  identical text): 4.4601 vs 4.4613 → **Δ 0.03%**. The gather is the only
+  patch that touches decode numerics; the rest are kernel-selection and
+  graph-reuse changes, and no end-to-end PPL A/B of the full patch set against
+  the unpatched base was run. Top-1 logits identical at 20K depth
+  (Δ logprob 0.0009); the checked-in gather-vs-dense regression test
+  `tests/test-qsa-gather-ms.cpp` runs under ctest on the CPU backend and pins
+  NMSE ≤ 4.4e-14 across the multi-sequence shapes.
 * Backend cross-check: Vulkan/RADV on the same commit measured pp 206/151 and
   decode 24.8/17.9 (@0/@16K) — ROCm with these patches wins everywhere.
   (Vulkan has since gained lightning-indexer kernels upstream; expect that gap
@@ -198,15 +276,16 @@ llama-bench pair, mmap with the engram fully page-cached (q8_0 KV, t4, ub 2048):
 | tg128 @ depth 0 | 24.6 | 22.8 |
 | tg128 @ 16K | 21.5 | 20.1 |
 
-Server-measured in true SSD-lazy mode (`--tensor-read-lazy on`):
+Server-measured with a cold-ish page cache, i.e. the engram really is read
+from SSD as it is used:
 
 | | IQ3_XXS | IQ4_XS |
 |---|---|---|
 | pp over a 20.8K prompt | 346.5 | **403.7 (+17%)** |
 | decode @ 20K | 20.3 | 19.2 |
 | decode, short | 24.4 | 22.5 |
-| decode, code, MTP combo | 34.6 | 31.1 |
-| decode, prose, MTP combo | 25.2 | 23.2 |
+| decode, code, MTP combo | 35.3 | 31.1 |
+| decode, prose, MTP combo | 25.1 | 23.2 |
 | decode @ 78K depth, MTP (identical prompt) | 21.3 | **24.7** |
 | decode @ 156K depth, MTP (identical prompt) | **12.1** | 11.4 |
 | prefill, average over the 156K prompt | 192.3 | **215.6** |
@@ -216,18 +295,23 @@ is cheaper in the MMQ path than IQ3 sign-unpacking) while paying ~7% decode.
 With its 2.5% better PPL, IQ4_XS is arguably the better default when you can
 spare the 11 GiB — it needs SSD mode for large contexts (60.4 GiB GPU part).
 
-Note on comparing tables: llama-bench mmap numbers have the engram fully
-cached (no lazy reads), which is why they exceed the lazy-mode server numbers
-at depth 0. Both are labeled accordingly.
+Note on comparing tables: the `llama-bench` mmap numbers have the engram fully
+in the page cache, which is why they exceed the lazy-mode server numbers at
+depth 0. The lazy-read path is active in both — `--tensor-read-lazy` defaults
+to `auto`, and `auto` already covers every lazy-marked tensor above 4 GiB, so
+passing `on` changes nothing for this tensor. The difference between the two
+tables is a warm vs. a cold page cache, not lazy on vs. off.
 
 ## RAM mode is a short-context mode (known bug with large slots)
 
-`-lm none` with large slots reproducibly deadlocks on the **first task**:
-the server becomes healthy, but the first request sits at
-`n_prompt_tokens_processed: 0` with the GPU idle, indefinitely. Reproduced
-three times (`-c 98304`, `-c 143360`, `-c 163840`; with and without the MTP
-sidecar; once on a freshly rebooted, otherwise idle box). `-c 32768` works
-flawlessly and delivers the best short-context numbers. Prime suspect is the
+`-lm none` with large slots deadlocks on the **first task**: the server becomes
+healthy, but the first request sits at `n_prompt_tokens_processed: 0` with the
+GPU idle, indefinitely. Reproduced with `-c 143360` and `-c 163840`, with and
+without the MTP sidecar. A `-c 98304` slot in RAM mode failed earlier for a
+different reason — it did not fit (92/92 GiB, thrash). `-c 32768` works
+flawlessly and delivers the best short-context numbers; nothing between 32K
+and 98K was tested, so the ~48K boundary quoted elsewhere is a memory/practice
+estimate rather than a measured deadlock threshold. Prime suspect is the
 pinned-host compute-buffer path (the #25992 iGPU workaround) with the large
 QSA buffers — on the debug list. You lose nothing meanwhile: at 16K depth
 both modes are already equal (KV/indexer-bound), so SSD-lazy is both the
@@ -235,5 +319,7 @@ only and the lossless option for long contexts.
 
 ## Raw data
 
-llama-bench JSONs, server logs, depth-curve CSVs and PPL logs are available on
-request (they are per-machine artifacts; open an issue on this fork).
+llama-bench JSONs, server logs, depth-curve CSVs and PPL logs are per-machine
+artifacts and are not committed. Open an issue on this fork if you want them,
+or ask via the discussions of the
+[HF sidecar repo](https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF/discussions).

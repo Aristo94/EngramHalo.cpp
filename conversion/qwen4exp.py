@@ -26,7 +26,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
+    # the MTP block is a separate draft head, exported as its own sidecar GGUF (--mtp)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
