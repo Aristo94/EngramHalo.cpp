@@ -34,7 +34,7 @@ on **SSD** (mmap load, i.e. the default or `-lm mmap`; ~1 GiB resident, full
 | pp @ d131k (delta rate) | 91 | 192 | — | — |
 | pp average over a 156K prompt | — | 192 | — | **216** |
 | resident engram | 26.8 GiB | **~1 GiB** [3] | 26.8 GiB pinned | ~1 GiB [3] |
-| max context (single slot) | 262K | **262K** | ~48K | 262K |
+| max context (single slot) | 262K | **262K** | 131K measured | 262K |
 
 Notes: the stock column is plain decode (MTP did not exist there) and is not a
 single build — see the build attribution below. `~` values are estimates or
@@ -97,7 +97,7 @@ for the full host setup story.
 
 ## Recommended server configs
 
-**A — interactive (single slot, ≤48K context, fastest):**
+**A — interactive (single slot, RAM mode, fastest):**
 
 ```bash
 toolbox run --container engramhalo \
@@ -136,11 +136,14 @@ stays SSD-backed (~1 GiB resident instead of 26.8 GiB). `--tensor-read-lazy`
 is already `auto` by default and `auto` covers this tensor (every lazy-marked
 tensor above 4 GiB), so `on` only makes the intent explicit — the switch that
 actually matters is mmap vs. no mmap. Do **not** use `--no-mmap`: it silently
-disables the lazy-read path. `-lm none` (RAM mode) is short-context only:
-with large slots the first request deadlocks (reproduced with `-c 143360` and
-`-c 163840`; `-c 32768` runs cleanly, nothing between 32K and 98K was tested).
-The ~48K boundary in the table above is a memory/practice estimate, not a
-measured deadlock threshold.
+disables the lazy-read path. `-lm none` (RAM mode) is for
+small-to-mid contexts: on the current build it is measured working up to
+`-c 131072` (24.8 t/s decode, 55.4 GiB GTT); `-c 262144` does not fit — the
+pinned table plus KV walk into the memory ceiling (~61 GiB GTT needed on top
+of everything else, available memory reaches zero). The first-request
+deadlock previously reproduced at `-c 143360`/`-c 163840` was observed on the
+2026-08-27 build and has not been re-tested on the current one; the band
+between 131K and 143K is unexplored.
 
 **C — throughput (multiple slots):**
 
@@ -196,6 +199,12 @@ and `--spec-draft-p-min 0.75` is what keeps prose from regressing.
 * PPL with 32K chunks OOMs on the larger quants (logits buffer × 248k vocab) — use 8K chunks.
 * n=1 hardware sample; measurement context matters (cold-start runs read low,
   repeated identical requests read high).
+* Model loading prints nothing while the GTT and the page cache fill from the
+  same physical memory pool — even on this box the load sits ~15 s at zero
+  available memory. With quants near the machine's RAM size (e.g. a ~100 GiB
+  file on 128 GB) that window stretches to minutes and can look like a hang at
+  `load_model:`. Watch GTT in nvtop / disk reads in iostat before assuming a
+  hang.
 
 ## Credits
 
