@@ -199,12 +199,17 @@ and `--spec-draft-p-min 0.75` is what keeps prose from regressing.
 * PPL with 32K chunks OOMs on the larger quants (logits buffer × 248k vocab) — use 8K chunks.
 * n=1 hardware sample; measurement context matters (cold-start runs read low,
   repeated identical requests read high).
-* Model loading prints nothing while the GTT and the page cache fill from the
-  same physical memory pool — even on this box the load sits ~15 s at zero
-  available memory. With quants near the machine's RAM size (e.g. a ~100 GiB
-  file on 128 GB) that window stretches to minutes and can look like a hang at
-  `load_model:`. Watch GTT in nvtop / disk reads in iostat before assuming a
-  hang.
+* During load, the GTT and the page cache fill from the same physical memory
+  pool. The loader now frees the page cache right behind each uploaded tensor
+  (`LLAMA_MMAP_DROP_BEHIND`, on by default), which cuts the transient peak by
+  ~88% on this box (28 GiB -> 2 GiB of extra cache; free memory during upload
+  0.8 -> 17+ GiB), and prints a progress line every 8 GiB so a slow load no
+  longer looks like a hang. Set `LLAMA_MMAP_DROP_BEHIND=1` to only unmap and
+  keep the cache warm — recommended when the same model is reloaded often
+  (e.g. behind a model-swapping proxy with a TTL); `=0` disables. Note: in RAM
+  mode (`-lm none`) the engram table is a regular tensor and the peak is not
+  reduced — deliberate, dropping pages mid-read of the 27 GiB tensor measured
+  45x slower prefill via swap thrash.
 
 ## Credits
 
