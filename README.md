@@ -2,9 +2,12 @@
 
 **llama.cpp, tuned for Qwen 3.8 Flash-Next on AMD Strix Halo** (Ryzen AI MAX+
 395 / Radeon 8060S, gfx1151): RDNA 3.5 kernel patches, true QSA sparse *gather*
-instead of dense masking, a working MTP draft head, and the model's 27 GB
-engram table living happily on SSD. Measured: **23.5 → 39.3 tok/s** on code,
-depth performance roughly doubled, quality untouched (PPL Δ 0.03%).
+instead of dense masking, a working MTP draft head, and the model's 27 GiB
+engram table living happily on SSD. Measured: **24.4 → 39.3 tok/s** on code,
+prefill at depth roughly doubled (91 → 192 t/s at 131K), decode at depth up
+~50% with MTP. The gather rewrite — the only patch that touches decode
+numerics — measures a wikitext-2 PPL delta of 0.03% against the dense-mask
+path in the same build.
 
 ➜ **Start here: [docs/strix-halo/README.md](docs/strix-halo/README.md)** —
 benchmarks, recommended configs, container build, MTP sidecar
