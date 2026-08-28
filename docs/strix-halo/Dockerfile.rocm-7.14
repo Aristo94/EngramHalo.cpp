@@ -36,15 +36,25 @@ ARG REPO=https://github.com/Aristo94/EngramHalo.cpp.git
 ARG BRANCH=strix-halo-qwen4exp
 RUN git clone -b ${BRANCH} --single-branch --recursive ${REPO} .
 
-# iGPU pinned-host-buffer workaround for ggml-org/llama.cpp#25992 (based on upstream #25863,
-# packaged in kyuz0/amd-strix-halo-toolboxes). Required for zero-copy engram gathers with -lm none.
+# iGPU host-buffer workaround for ggml-org/llama.cpp#25992 (based on the open upstream PR #25863,
+# packaged in kyuz0/amd-strix-halo-toolboxes). It disables ROCm host-buffer compute on integrated
+# GPUs: a correctness workaround for the multi-slot response mix-up reported in #25992. It also
+# determines where the engram gathers get scheduled with -lm none.
 COPY llama-cpp-25992-rocm-host-buffer.patch /tmp/
+# Loader patch used in the measured builds (per-buffer mmap / async uploads). Applied when it
+# still fits the tree, skipped as obsolete otherwise.
+COPY llama-cpp-qwen38-per-buffer-mmap.patch /tmp/
 RUN if git apply --check /tmp/llama-cpp-25992-rocm-host-buffer.patch; then \
       git apply /tmp/llama-cpp-25992-rocm-host-buffer.patch; \
     elif git apply --reverse --check /tmp/llama-cpp-25992-rocm-host-buffer.patch; then \
       echo "#25992 workaround already present upstream"; \
     else \
-      echo "WARNING: #25992 workaround no longer applies; -lm none performance may regress"; \
+      echo "WARNING: #25992 workaround no longer applies; multi-slot serving may return wrong responses"; \
+    fi \
+  && if git apply --check /tmp/llama-cpp-qwen38-per-buffer-mmap.patch; then \
+      git apply /tmp/llama-cpp-qwen38-per-buffer-mmap.patch; \
+    else \
+      echo "per-buffer mmap loader patch skipped as obsolete"; \
     fi \
   && cmake -S . -B build \
   -DGGML_HIP=ON \
