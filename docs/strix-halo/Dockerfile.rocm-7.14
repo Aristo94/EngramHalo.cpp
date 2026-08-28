@@ -1,7 +1,7 @@
 # llama.cpp for AMD Strix Halo (gfx1151) — ROCm 7.14, builds the strix-halo-qwen4exp branch.
 # Container layout follows kyuz0/amd-strix-halo-toolboxes. Use with podman/toolbox:
-#   podman build -f Dockerfile.rocm-7.14 -t llama-strix-qwen4exp .
-#   toolbox create llama-strix-qwen4exp --image localhost/llama-strix-qwen4exp -- \
+#   podman build -f Dockerfile.rocm-7.14 -t engramhalo .
+#   toolbox create engramhalo --image localhost/engramhalo -- \
 #     --device /dev/dri --device /dev/kfd --group-add video --group-add render --security-opt seccomp=unconfined
 
 # build stage
