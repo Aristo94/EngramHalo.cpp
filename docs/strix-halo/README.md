@@ -83,8 +83,8 @@ nondeterminism from batched verification — not separately measured.
 
 ```bash
 cd docs/strix-halo
-podman build -f Dockerfile.rocm-7.14 -t llama-strix-qwen4exp .
-toolbox create llama-strix-qwen4exp --image localhost/llama-strix-qwen4exp -- \
+podman build -f Dockerfile.rocm-7.14 -t engramhalo .
+toolbox create engramhalo --image localhost/engramhalo -- \
   --device /dev/dri --device /dev/kfd --group-add video --group-add render \
   --security-opt seccomp=unconfined
 ```
@@ -100,7 +100,7 @@ for the full host setup story.
 **A — interactive (single slot, ≤48K context, fastest):**
 
 ```bash
-toolbox run --container llama-strix-qwen4exp \
+toolbox run --container engramhalo \
   env ROCBLAS_USE_HIPBLASLT=1 \
   llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
   -ngl 999 -fa on -ctk q8_0 -ctv q8_0 \
