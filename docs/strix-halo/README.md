@@ -127,12 +127,25 @@ maintainers) · [#27739](https://github.com/ggml-org/llama.cpp/pull/27739)
 (container pattern, host tuning, FA tile groundwork) ·
 [#26592](https://github.com/ggml-org/llama.cpp/pull/26592)/[#26388](https://github.com/ggml-org/llama.cpp/pull/26388)
 (hipCUB top-k groundwork) ·
+[#27466](https://github.com/ggml-org/llama.cpp/pull/27466)
+(radix TOP_K for long rows — the closest prior art to our top-k kernel) ·
 [#26001](https://github.com/ggml-org/llama.cpp/pull/26001)/[#20377](https://github.com/ggml-org/llama.cpp/pull/20377)
 (chunked GDN prior art) ·
 [#27794](https://github.com/ggml-org/llama.cpp/pull/27794) (tensor-read-lazy) ·
 [#21458](https://github.com/ggml-org/llama.cpp/pull/21458) (DSA gather op) ·
 dzannotti's MTP GGUF repo and the community fork that first ran a qwen4exp
 MTP draft on an 8060S.
+
+Related upstream work (independent, developed in parallel — compare before
+reusing anything from here):
+[#25917](https://github.com/ggml-org/llama.cpp/pull/25917) (sparse KV indices
+inside the MMA FA kernel — the kernel-level counterpart to our graph-level QSA
+gather) ·
+[#26419](https://github.com/ggml-org/llama.cpp/pull/26419) (MMA FA head-dim 256
+on AMD RDNA; enables gfx1151 in code, measured on RDNA4 only) ·
+[#27836](https://github.com/ggml-org/llama.cpp/pull/27836) (qwen4exp MTP as a
+trailing block in the target GGUF — the upstream follow-up path; this branch
+uses a standalone sidecar instead).
 
 Model license: [Qwen Community License 1.0](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
 (distribution permitted with notice; MaaS restrictions apply — read it).
