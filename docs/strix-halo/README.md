@@ -231,10 +231,14 @@ Nathan Wilson's [strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-
 contiguize, mul_mat_id row-lists, and an independently developed qwen4exp
 NextN/MTP loader and draft graph following the deepseek4/deepseek32 pattern;
 backend-disjoint from this ROCm/HIP-only branch) ·
-Unsloth's `LLAMA_MMAP_RANDOM` batched page prefetch (independent
-implementation of the same row-prefetch technique behind the SSD-resident
-engram table, reached on the #27742 follow-up branch on 2026-08-27; this
-branch drives it from upstream's `TENSOR_READ_LAZY` (#27794) instead) ·
+Unsloth's `LLAMA_MMAP_RANDOM` batched page prefetch (commit `95da4ba` on the
+#27742 follow-up branch: `MADV_RANDOM` plus one merged `POSIX_MADV_WILLNEED`
+per ubatch, authored 2026-08-27 — not part of the merged squash and not in
+master as of this writing; an independent implementation of the same
+row-prefetch technique behind the SSD-resident engram table, which this
+branch drives from upstream's `TENSOR_READ_LAZY` (#27794) instead. A third,
+simpler option — pinning the table to the host via `-ot "ple_ngram_embd=CPU"`
+— is described in #27739, at the cost of paying NVMe latency per gather) ·
 adjacent RDNA 3.5 `ggml-cuda` work by Gaetan Puleo (gated-delta-net tuning,
 tiled FA, MMVQ Q8_1 caching) and Nathan Wilson (tile dequant-on-load for
 quantized-KV decode) — neighbouring ground to the HIP kernels here, developed
