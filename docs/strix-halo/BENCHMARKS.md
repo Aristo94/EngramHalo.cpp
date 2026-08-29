@@ -62,6 +62,11 @@ compete for the same physical 92 GiB pool. This matters for every number below.
 * **Repeats read high:** sending the identical request again measures up to
   ~35% fast (prompt cache + the ngram speculator has seen the answer: 52.7 vs
   39.3 t/s in our tests). Always use a fresh prompt for the measured run.
+* **Synthetic prompts break MTP decode numbers:** after a random-word filler
+  prompt at temperature 0 the model degenerates into repetitive output, the
+  ngram speculator hits up to 100% draft acceptance, and decode reads 2–3x
+  high (73 t/s observed). Measure MTP decode on real code/prose payloads only;
+  prefill (pp) is unaffected by prompt content.
 * PPL with 32K chunks OOMs on larger quants (logits buffer × 248,320 vocab ≈
   32 GiB fp32) — use 8K chunks.
 * `llama-perplexity --multiple-choice` crashes on every build of the qwen4exp
@@ -150,6 +155,46 @@ two are already in the baseline. "After" = this branch.
 
 The remaining depth decay is the QSA indexer itself (it still scores O(ctx/4)
 blocks per token) — the next structural target.
+
+## Depth curves on the shipped branch (2026-08-28, single build)
+
+Measured on the exact tree this branch ships (pre-rebase equivalent of the
+current HEAD; content-identical patches). Different method than the
+before/after table above: `llama-bench -p 2048 -n 64 -d <depth> -r 1`
+(marginal cost *at* the depth, not a server average), q8_0 KV, t4, ub 2048,
+hipBLASLt, SSD mode, cold page cache per run.
+
+| depth | IQ3 pp2048 / tg64 | IQ4_XS pp2048 / tg64 |
+|---|---|---|
+| 4K | 470.9 / 22.5 | 478.7 / 20.9 |
+| 8K | 435.7 / 21.2 | 441.7 / 19.9 |
+| 16K | 383.3 / 20.4 | 382.2 / 19.0 |
+| 32K | 315.6 / 17.9 | 318.8 / 17.0 |
+| 64K | 248.5 / 13.2 | 240.8 / 12.2 |
+| 128K | 174.4 / 9.1 | 169.1 / 8.3 |
+
+Prefill is quant-independent across the whole curve (IQ4 even leads at
+shallow depth), and the IQ4 decode tax shrinks with depth (−7% at 4K, −9% at
+128K) as attention/indexer cost dominates the weights.
+
+**MTP decode at depth (server, real code payloads, temperature 0, Q8_0
+sidecar, `draft-mtp,ngram-mod`, n-max 4, p-min 0.75):**
+
+| context depth | decode | draft acceptance | vs. plain decode |
+|---|---|---|---|
+| ~0K (32K slot) | 36.4 t/s | 79.6% | +47% (24.7) |
+| 77.7K (131K slot) | 21.6 t/s | 73.5% | +63% (13.2 @64K) |
+| 156.4K (163840 slot) | 20.8 t/s | 66.0% | >2x (9.1 @128K) |
+
+The MTP win *grows* with depth: each accepted draft token amortizes the
+per-step attention/indexer cost. A 156K-token prompt prefills in ~12 minutes
+(221.7 t/s average over the whole prompt with the sidecar loaded) and then
+decodes at 20+ t/s. Acceptance degrades only mildly with depth.
+
+Prefill with the full MTP stack loaded (server, `cache_prompt=false`, fresh
+~4–86K-token prompts): 464 t/s avg at 5.4K, 402 at 21K, 342 at 43K, 272 at
+86K — within a few percent of the plain llama-bench curve, i.e. the sidecar
+costs prefill essentially nothing.
 
 ## Flag matrix (stock build `b8bdf73bb`, the free wins)
 
