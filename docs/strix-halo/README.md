@@ -199,6 +199,13 @@ and `--spec-draft-p-min 0.75` is what keeps prose from regressing.
 * PPL with 32K chunks OOMs on the larger quants (logits buffer × 248k vocab) — use 8K chunks.
 * n=1 hardware sample; measurement context matters (cold-start runs read low,
   repeated identical requests read high).
+* One community report (native ROCm 7.2.4 build on Ubuntu, `HSA_XNACK=1`,
+  `HSA_ENABLE_SDMA=0`): `--tensor-read-lazy on` hangs indefinitely.
+  Not reproduced here — lazy mode runs clean for hours on the TheRock 7.14
+  container stack this branch is tested on; XNACK changes the page-fault path
+  lazy reads depend on. If you hit it: drop `--tensor-read-lazy` (mmap mode
+  still works, the first prefill just pays the cold reads) and please open an
+  issue with your commit hash, ROCm version, and where it hangs.
 * During load, the GTT and the page cache fill from the same physical memory
   pool. The loader now frees the page cache right behind each uploaded tensor
   (`LLAMA_MMAP_DROP_BEHIND`, on by default), which cuts the transient peak by
@@ -245,6 +252,14 @@ Nathan Wilson's [strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-
 contiguize, mul_mat_id row-lists, and an independently developed qwen4exp
 NextN/MTP loader and draft graph following the deepseek4/deepseek32 pattern;
 backend-disjoint from this ROCm/HIP-only branch) ·
+[apepojken/llama.cpp `qwen4exp-spec-mtp`](https://github.com/apepojken/llama.cpp)
+(a Vulkan-first speculative-decoding and native-MTP overhaul for the same
+model on a 128 GB Strix Halo box: recurrent-rollback whitelisting, per-stream
+MTP combiner drafting 6 deep, an incremental pooled-key cache for the QSA
+indexer, and Vulkan kernel fusion; ports this branch's HIP radix top-k and
+the gathered-attention idea to Vulkan, with credit in both directions —
+their independently found rollback-ring and combiner results corroborate
+findings here) ·
 Unsloth's `LLAMA_MMAP_RANDOM` batched page prefetch (commit `95da4ba` on the
 #27742 follow-up branch: `MADV_RANDOM` plus one merged `POSIX_MADV_WILLNEED`
 per ubatch, authored 2026-08-27 — not part of the merged squash and not in
