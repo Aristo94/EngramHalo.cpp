@@ -2,16 +2,19 @@
 
 **llama.cpp, tuned for Qwen 3.8 Flash-Next on AMD Strix Halo** (Ryzen AI MAX+
 395 / Radeon 8060S, gfx1151): RDNA 3.5 kernel patches, true QSA sparse *gather*
-instead of dense masking, a working MTP draft head, and the model's 27 GiB
-engram table living happily on SSD. Measured: **24.4 → 39.3 tok/s** on code,
-prefill at depth roughly doubled (91 → 192 t/s at 131K), decode at depth up
-~50% with MTP. The gather rewrite — the only patch that touches decode
-numerics — measures a wikitext-2 PPL delta of 0.03% against the dense-mask
-path in the same build.
+instead of dense masking, a fused QSA indexer top-k kernel, a working MTP draft
+head, and the model's 27 GiB engram table living happily on SSD. Measured:
+**24.4 → 39.3 tok/s** on code, prefill at depth roughly doubled (91 → 192 t/s
+at 131K) with a further +17% prefill / +5% decode @ 64K from the 2026-09-19
+boost series, decode at depth up ~50% with MTP. The gather rewrite — the only
+patch that touches decode numerics — measures a wikitext-2 PPL delta of 0.03%
+against the dense-mask path in the same build; the fused top-k selects
+bit-identically (PPL 2.1744 both ways).
 
 ➜ **Start here: [docs/strix-halo/README.md](docs/strix-halo/README.md)** —
 benchmarks, recommended configs, container build, MTP sidecar
-([prebuilt on HF](https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF)).
+([prebuilt on HF](https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF) —
+needs a re-convert for current builds, see docs/strix-halo/README.md).
 
 Based on [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
 ([PR #27742](https://github.com/ggml-org/llama.cpp/pull/27742) lineage);

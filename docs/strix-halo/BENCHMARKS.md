@@ -33,7 +33,10 @@ compete for the same physical 92 GiB pool. This matters for every number below.
   The engram table (`per_layer_token_embd`) is byte-identical in all quants:
   one IQ4_NL tensor, 26.82 GiB, always CPU-side.
 * MTP sidecar: [EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF](https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF)
-  (Q8_0, 4.1 GB), built with this branch's converter.
+  (Q8_0, 4.1 GB), built with this branch's converter. **Note (2026-09-19):**
+  the file there predates upstream #28901 and no longer loads (`tensor
+  'output_hc_norm.weight' not found`); re-convert with a current checkout of
+  this branch to get the working `-hc-` variant.
 
 ## Methodology
 
@@ -53,6 +56,8 @@ compete for the same physical 92 GiB pool. This matters for every number below.
 * One variable per run, against a named anchor.
 * The chunked GDN prefill kernel is opt-in on RDNA3/RDNA4 via
   `GGML_HIP_GDN_CHUNK=1` and was **not** enabled in any run below.
+  (Since 2026-09-19 it is default-on on RDNA3/4 — see the boost-campaign
+  section; all runs there have it active.)
 
 ### Measurement pitfalls (you will hit these)
 
@@ -195,6 +200,52 @@ Prefill with the full MTP stack loaded (server, `cache_prompt=false`, fresh
 ~4–86K-token prompts): 464 t/s avg at 5.4K, 402 at 21K, 342 at 43K, 272 at
 86K — within a few percent of the plain llama-bench curve, i.e. the sidecar
 costs prefill essentially nothing.
+
+## Boost campaign (2026-09-19): +17% prefill, fused QSA top-k
+
+Four commits on top of the branch state above, all measured like-for-like
+(`llama-bench -ngl 999 -fa 1 -ctk q8_0 -ctv q8_0 -b 8192 -ub 2048 -t 4
+-p 2048 -n 64 -r 4`, hipBLASLt, IQ3_XXS, single process, exclusive box):
+
+* `HIP: enable chunked GDN prefill by default on RDNA3/4` — the chunked GDN
+  kernel (previously opt-in) becomes the default. Alone: +13.1% pp2048 @ d0,
+  +10% @ d16k.
+* `llama : gather lazy tensor rows with direct reads` (upstream #29030,
+  merged with the branch's mmap prefetch kept for non-direct paths): cold
+  pp512 **279 -> 443 t/s (+59%)**, warm pp2048 +1.5%.
+* `HIP : MMVQ per-type batch thresholds + SWAR + concat tiled transpose`
+  (upstream #28613 + #28616 + #28303).
+* `HIP: fuse QSA indexer expand+mask+top_k into radix top-k passes` — new
+  kernel, this branch only: the `[n_kv, n_tps, n_stream]` f32 score tensor is
+  never materialized; the radix top-k passes fetch
+  `score_blk[cell_blk[c,s],t,s] + addend[c,t,s]` on the fly. Bit-identical
+  selection (same f32 add, same passes, same ties). Default-on,
+  `GGML_CUDA_QSA_FUSED_TOPK=0` opts out.
+
+| pp2048 / tg64 | base | +GDN+MMVQ+29030 | +fused top-k | total |
+|---|---|---|---|---|
+| d0 | 606.4 / — | 713.9 | 710.2 | **+17.1%** |
+| d16384 | 468.6 / — | 526.7 | 542.4 | **+15.8%** |
+| d65536 | 263.8 / ~15.0 | 276.6 | 298.1 / 16.04 | **+13.0% / +7%** |
+
+The fused top-k gain grows with depth (the skipped tensor is 32x larger at
+64K than at 2K): +0.2% @ d0, +3.5% @ d16k, +5.3% @ d64k prefill; +5% tg @
+d64k.
+
+Quality gates: wikitext-2 PPL 2.1744 +/- 0.0416 **identical** fused vs.
+unfused (2x8K chunks, fusion trace-confirmed active up to n_kv 8192); greedy
+CLI outputs identical; `test-backend-ops -o TOP_K` 525/525 on the extended
+shapes. MTP with the `-hc-` sidecar on the final build: **37.1 t/s** code
+decode, 86.5% acceptance (32K slot, temperature 0).
+
+Caveat, 224K: the 137.9 t/s @ 224K published in the depth-curve table above
+(2026-08-28 build) does **not** reproduce on the current rebase — base and
+patched builds both read ~70-75 t/s there. That is upstream drift between
+2026-08-27 and the current master, not one of these patches (unbisected).
+
+Rejected with measurements during the campaign: #26419 (MMA flash-attention
+hd256 on gfx1151: -9/-13%), #28195 (no IQ3_XXS tile coverage), a 64-row
+IQ3_XXS MMQ tile extension (flat prefill).
 
 ## Flag matrix (stock build `b8bdf73bb`, the free wins)
 

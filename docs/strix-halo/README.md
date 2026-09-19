@@ -73,11 +73,15 @@ nondeterminism from batched verification — not separately measured.
 |---|---|
 | `HIP: wide top-k selection kernel` | The QSA indexer's `top_k` fell back to CPU 12×/token past ~1K context (the "one CPU core at 100%" symptom). Fixes the long-context decode collapse. |
 | `CUDA/HIP: skip fully-masked warp slices…` | A backend-generic early exit for fully masked warp slices in the FA vector kernel, which affects every model with masked attention, not just qwen4exp. Also picks the vector kernel on RDNA for the qwen4exp attention shape (hd 256, GQA 2, q8_0 KV). |
-| `HIP: chunked GATED_DELTA_NET prefill` | The GDN prefill kernel was token-serial (36 of 48 layers). Chunked kernel, opt-in on RDNA3/RDNA4 via `GGML_HIP_GDN_CHUNK=1` (default-active on NVIDIA Ampere+ and CDNA). It is **not** active in any of the numbers published here. |
+| `HIP: chunked GATED_DELTA_NET prefill` | The GDN prefill kernel was token-serial (36 of 48 layers). Chunked kernel, originally opt-in on RDNA3/RDNA4 via `GGML_HIP_GDN_CHUNK=1`; a later commit (below) makes it default-on there. |
 | `mmap: prefetch lazily read rows…` | Batched `posix_madvise` readahead for the SSD-backed engram rows: one hint per page-merged row range instead of one page fault per row. The same commit adds an IQ4_NL `get_rows` path for row lengths that are not a multiple of QK_K — without it the 160-value engram gather could not run on the GPU at all. Decode-graph reuse for the qwen4exp inputs is part of the upstream arch since #27742 and is no longer carried here. |
 | `qwen4exp: gather top-k KV rows…` | QSA "sparse" attention actually ran dense with a mask — full KV bandwidth at any depth. Decode now gathers the ~2.3K selected rows (top_k 2048 plus the block tail, padded to the FA granularity of 256). Env-gated: `LLAMA_QSA_GATHER=0` disables it, an integer sets the activation threshold in `n_kv` (default 16384, i.e. on from 16K context). Multi-sequence ubatches (`--parallel > 1`, eval tools) fall back to the masked path by default; `LLAMA_QSA_GATHER_MS=1` opts them into the gather for validation runs, and `LLAMA_QSA_GATHER_TRACE=1` logs every gather graph build with its shape. Graph-level correctness of the multi-sequence shapes is pinned by `tests/test-qsa-gather-ms.cpp` on the CPU backend; it is not validated on HIP yet, which is what the default gate is for. |
 | `qwen4exp: MTP draft head…` | Multi-token prediction with the draft weights from the official checkpoint. Reference design: [#27739](https://github.com/ggml-org/llama.cpp/pull/27739). |
 | `convert: export the qwen4exp MTP block` | Lets you build the MTP sidecar GGUF yourself (see below). |
+| `HIP: enable chunked GDN prefill by default on RDNA3/4` | The chunked GATED_DELTA_NET kernel (above) is now default-on on RDNA3/4; `GGML_HIP_GDN_CHUNK=0` opts out. +13% pp2048 @ d0, +10% @ d16k on its own. |
+| `llama : gather lazy tensor rows with direct reads` | Upstream [#29030](https://github.com/ggml-org/llama.cpp/pull/29030), merged against this branch's mmap prefetch (prefetch stays for non-direct paths, gated off in direct mode). Cold pp512 279 -> 443 t/s (+59%) on gfx1151. |
+| `HIP : MMVQ per-type batch thresholds, SWAR, concat tiled transpose` | Upstream [#28613](https://github.com/ggml-org/llama.cpp/pull/28613) + [#28616](https://github.com/ggml-org/llama.cpp/pull/28616) + [#28303](https://github.com/ggml-org/llama.cpp/pull/28303) combined. |
+| `HIP: fuse QSA indexer expand+mask+top_k into radix top-k passes` | The QSA indexer no longer materializes the `[n_kv, n_tps, n_stream]` f32 score tensor: the radix top-k passes fetch `score_blk[cell_blk] + addend` on the fly. Selection is bit-identical to the unfused path (same f32 add, same passes, same tie handling). +3.5% pp2048 @ d16k, +5.3% @ d64k, +5% tg @ d64k. Default-on; `GGML_CUDA_QSA_FUSED_TOPK=0` opts out, `_TRACE=1` logs every fused call. |
 
 ## Quick start (container, kyuz0-style)
 
@@ -105,7 +109,7 @@ toolbox run --container engramhalo \
   llama-server -m Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf \
   -ngl 999 -fa on -ctk q8_0 -ctv q8_0 \
   -lm none -c 32768 -b 8192 -ub 2048 -t 4 --parallel 1 --jinja --no-webui \
-  -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf \
+  -md mtp-Qwen3.8-Flash-Next-hc-Q8_0.gguf \
   --spec-type draft-mtp,ngram-mod --spec-draft-n-max 4 --spec-draft-p-min 0.75
 ```
 
@@ -123,7 +127,7 @@ toolbox run --container engramhalo \
   -ngl 999 -fa on -ctk q8_0 -ctv q8_0 \
   -lm mmap --tensor-read-lazy on -c 262144 -b 8192 -ub 2048 -t 4 \
   --parallel 1 --jinja --no-webui \
-  -md mtp-Qwen3.8-Flash-Next-Q8_0.gguf \
+  -md mtp-Qwen3.8-Flash-Next-hc-Q8_0.gguf \
   --spec-type draft-mtp,ngram-mod --spec-draft-n-max 4 --spec-draft-p-min 0.75
   # With the MTP sidecar, prefer -c 163840: MTP is validated up to a 164K
   # slot, a 256K slot + MTP was never run. Without -md, the full -c 262144
@@ -183,10 +187,18 @@ With this branch's converter:
 ```bash
 python convert_hf_to_gguf.py --remote --mtp Qwen/Qwen3.8-Flash-Next \
   --outfile mtp-Qwen3.8-Flash-Next-BF16.gguf --outtype bf16   # ~8 GB download
-llama-quantize mtp-Qwen3.8-Flash-Next-BF16.gguf mtp-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0
+llama-quantize mtp-Qwen3.8-Flash-Next-BF16.gguf mtp-Qwen3.8-Flash-Next-hc-Q8_0.gguf Q8_0
 ```
 
-A prebuilt Q8_0 sidecar is at **https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF**. The Q8 sidecar measured *better*
+**Use the `-hc-` file name, and convert with a current checkout of this
+branch.** Since upstream #28901 the loader requires the hyper-connection
+tensors (`hc_attn_*`, `output_hc_norm.weight`) in the sidecar; a sidecar
+converted before that lands — including the Q8_0 file currently at
+**https://huggingface.co/EasiiX/Qwen3.8-Flash-Next-MTP-Strix-Halo-GGUF**
+(2026-08-27) — fails to load with
+`check_tensor_dims: tensor 'output_hc_norm.weight' not found`. Re-converting
+with this branch produces the working `-hc-` variant (same weights, the hc
+tensors included). The Q8 sidecar measured *better*
 than BF16 (half the draft reads, quant-matched errors → higher acceptance),
 and `--spec-draft-p-min 0.75` is what keeps prose from regressing.
 
