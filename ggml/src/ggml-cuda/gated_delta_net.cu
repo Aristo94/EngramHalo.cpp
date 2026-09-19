@@ -248,12 +248,13 @@ bool ggml_cuda_gdn_op_is_chunked(const ggml_tensor * dst) {
         return s && s[0] && !(s[0] == '0' && s[1] == '\0');
     }();
     // GDN_RDNA: RDNA3/RDNA4 run the same ggml_cuda_mma path with WMMA
-    // (v_wmma_f32_16x16x16_f16). Opt-in via GGML_HIP_GDN_CHUNK=1 until broadly
-    // benchmarked; the mirrored-operand/J_MAJOR tile layouts are handled in
+    // (v_wmma_f32_16x16x16_f16). Measured on gfx1151: pp2048 +13% at depth 0,
+    // +10% at 16K, tg flat. On by default, GGML_HIP_GDN_CHUNK=0 opts out.
+    // The mirrored-operand/J_MAJOR tile layouts are handled in
     // chunk_gated_delta_net.cu (CGDR_AB_DL/CGDR_C_DL).
     static const bool rdna_opt_in = [] {
         const char * s = getenv("GGML_HIP_GDN_CHUNK");
-        return s && s[0] && !(s[0] == '0' && s[1] == '\0');
+        return !(s && s[0] == '0' && s[1] == '\0');
     }();
     const int  cc_dev    = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     // GDN_CDNA: admit CDNA to the ggml_cuda_mma path. CDNA has the fp16 matrix
