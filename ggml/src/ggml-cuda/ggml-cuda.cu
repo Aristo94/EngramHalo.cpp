@@ -3444,6 +3444,190 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+#if defined(GGML_USE_HIP)
+// match the QSA indexer chain emitted by qwen4exp build_qsa_top_k:
+//   get_rows(cont(permute(score_blk)), cell_blk) -> permute -> cont
+//   -> [cpy ->] [reshape ->] add -> top_k -> cont
+// and select from score_blk[cell_blk[c, s], t, s] + addend[c, t, s] without
+// materializing the [n_kv, n_tps, n_stream] expansion. returns the number of
+// nodes to skip, 0 when the chain does not match.
+static int ggml_cuda_try_topk_qsa_fusion(
+        ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx,
+        ggml_cuda_topk_qsa_args & args) {
+    static const bool qsa_fused_topk = [] {
+        const char * env = getenv("GGML_CUDA_QSA_FUSED_TOPK");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    if (!qsa_fused_topk) {
+        return 0;
+    }
+
+    const int      n_nodes = cgraph->n_nodes;
+    ggml_tensor ** nodes   = cgraph->nodes;
+
+    if (node_idx + 6 >= n_nodes) {
+        return 0;
+    }
+
+    ggml_tensor * get_rows = nodes[node_idx];
+    if (get_rows->op != GGML_OP_GET_ROWS || get_rows->type != GGML_TYPE_F32) {
+        return 0;
+    }
+
+    ggml_tensor * cont_a    = get_rows->src[0];
+    ggml_tensor * perm_a    = cont_a != nullptr ? cont_a->src[0] : nullptr;
+    ggml_tensor * score_blk = perm_a != nullptr ? perm_a->src[0] : nullptr;
+    if (cont_a == nullptr || cont_a->op != GGML_OP_CONT ||
+        perm_a == nullptr || perm_a->op != GGML_OP_PERMUTE ||
+        score_blk == nullptr || score_blk->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(score_blk) || score_blk->ne[3] != 1) {
+        return 0;
+    }
+    // ggml_permute stores no axes, so the view shape/strides must be the
+    // swapped ones (ggml_permute(x, 1, 0, 2, 3))
+    if (perm_a->ne[0] != score_blk->ne[1] || perm_a->ne[1] != score_blk->ne[0] ||
+        perm_a->ne[2] != score_blk->ne[2] || perm_a->ne[3] != score_blk->ne[3] ||
+        perm_a->nb[0] != score_blk->nb[1] || perm_a->nb[1] != score_blk->nb[0] ||
+        perm_a->nb[2] != score_blk->nb[2] || perm_a->nb[3] != score_blk->nb[3]) {
+        return 0;
+    }
+
+    ggml_tensor * cell_blk = get_rows->src[1];
+    if (cell_blk == nullptr || cell_blk->type != GGML_TYPE_I32 || !ggml_is_contiguous(cell_blk) ||
+        cell_blk->ne[2] != 1 || cell_blk->ne[3] != 1) {
+        return 0;
+    }
+
+    const int64_t n_blocks = score_blk->ne[0];
+    const int64_t n_tps    = score_blk->ne[1];
+    const int64_t n_stream = score_blk->ne[2];
+    const int64_t n_kv     = cell_blk->ne[0];
+
+    // below 1024 columns top_k uses the bitonic path, keep the fused path in
+    // the radix regime only
+    if (cell_blk->ne[1] != n_stream || n_blocks <= 0 || n_tps <= 0 || n_stream <= 0 || n_kv <= 1024) {
+        return 0;
+    }
+
+    ggml_tensor * perm_b = nodes[node_idx + 1];
+    ggml_tensor * cont_b = nodes[node_idx + 2];
+    if (perm_b->op != GGML_OP_PERMUTE || perm_b->src[0] != get_rows ||
+        cont_b->op != GGML_OP_CONT   || cont_b->src[0] != perm_b) {
+        return 0;
+    }
+    if (perm_b->ne[0] != get_rows->ne[1] || perm_b->ne[1] != get_rows->ne[0] ||
+        perm_b->ne[2] != get_rows->ne[2] || perm_b->ne[3] != get_rows->ne[3] ||
+        perm_b->nb[0] != get_rows->nb[1] || perm_b->nb[1] != get_rows->nb[0] ||
+        perm_b->nb[2] != get_rows->nb[2] || perm_b->nb[3] != get_rows->nb[3]) {
+        return 0;
+    }
+    if (cont_b->ne[0] != n_kv || cont_b->ne[1] != n_tps || cont_b->ne[2] != n_stream || cont_b->ne[3] != 1 ||
+        cont_b->type != GGML_TYPE_F32 || !ggml_is_contiguous(cont_b)) {
+        return 0;
+    }
+
+    // optional mask tail between cont_b and the add: the f16->f32 cast the
+    // graph builds for the f16 flash attention mask, then a reshape
+    int           j      = node_idx + 3;
+    ggml_tensor * addend = nullptr;
+    if (nodes[j]->op == GGML_OP_CPY) {
+        ggml_tensor * cpy = nodes[j];
+        if (cpy->type != GGML_TYPE_F32 || cpy->src[0] == nullptr || cpy->src[1] != cpy ||
+            cpy->src[0]->type != GGML_TYPE_F16) {
+            return 0;
+        }
+        addend = cpy->src[0];
+        j++;
+    }
+    if (j < n_nodes && nodes[j]->op == GGML_OP_RESHAPE) {
+        if (addend == nullptr) {
+            addend = nodes[j]->src[0];
+        }
+        j++;
+    }
+
+    if (j + 2 >= n_nodes) {
+        return 0;
+    }
+    ggml_tensor * add = nodes[j];
+    if (add->op != GGML_OP_ADD || add->src[0] != cont_b || add->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(add)) {
+        return 0;
+    }
+    if (j > node_idx + 3 && add->src[1] != nodes[j - 1]) {
+        return 0;
+    }
+    if (addend == nullptr) {
+        addend = add->src[1];
+    }
+    if (addend == nullptr || (addend->type != GGML_TYPE_F32 && addend->type != GGML_TYPE_F16) ||
+        !ggml_is_contiguous(addend) || addend->ne[0] != n_kv ||
+        ggml_nelements(addend) != n_kv * n_tps * n_stream) {
+        return 0;
+    }
+
+    ggml_tensor * top_k = nodes[j + 1];
+    ggml_tensor * cont  = nodes[j + 2];
+    if (top_k->op != GGML_OP_TOP_K || top_k->src[0] != add || top_k->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(top_k) || top_k->ne[1] != n_tps || top_k->ne[2] != n_stream || top_k->ne[3] != 1 ||
+        cont->op != GGML_OP_CONT || cont->src[0] != top_k || cont->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(cont) || cont->ne[0] != top_k->ne[0] ||
+        cont->ne[1] != n_tps || cont->ne[2] != n_stream || cont->ne[3] != 1) {
+        return 0;
+    }
+
+    const int64_t k = top_k->ne[0];
+    if (k <= 0 || k > n_kv) {
+        return 0;
+    }
+
+    // elided nodes must be single-use chain links (a cast cpy also references
+    // itself) and no graph outputs
+    for (int m = node_idx; m <= j + 1; ++m) {
+        const ggml_tensor * t = nodes[m];
+        if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+        int32_t n_uses = 1;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] == t) {
+                n_uses++;
+            }
+        }
+        if (ggml_node_get_use_count(cgraph, m) != n_uses) {
+            return 0;
+        }
+    }
+
+    args.score_blk = (const float *) score_blk->data;
+    args.cell_blk  = (const int *)   cell_blk->data;
+    args.addend    = addend->data;
+    args.add_f16   = addend->type == GGML_TYPE_F16;
+    args.n_blocks  = (int) n_blocks;
+    args.n_tps     = (int) n_tps;
+    args.n_stream  = (int) n_stream;
+    args.n_kv      = (int) n_kv;
+
+    static const bool trace = [] {
+        const char * env = getenv("GGML_CUDA_QSA_FUSED_TOPK_TRACE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (trace) {
+        fprintf(stderr, "qsa-fused-topk: n_kv=%d n_tps=%d n_stream=%d n_blocks=%d k=%d skip=%d add=%s\n",
+                (int) n_kv, (int) n_tps, (int) n_stream, (int) n_blocks, (int) k, j + 2 - node_idx,
+                args.add_f16 ? "f16" : "f32");
+    }
+
+    ggml_cuda_op_top_k_qsa(*cuda_ctx, args, cont);
+
+#ifdef GGML_CUDA_DEBUG
+    GGML_LOG_INFO("%s: fused qsa topk for %s (skipped %d nodes, n_kv=%d, n_tps=%d, k=%d)\n",
+                  __func__, cont->name, j + 2 - node_idx, (int) n_kv, (int) n_tps, (int) k);
+#endif
+    return j + 2 - node_idx;
+}
+#endif // defined(GGML_USE_HIP)
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3453,6 +3637,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+#ifdef GGML_USE_HIP
+    // qsa indexer expand+mask+top_k
+    if (node->op == GGML_OP_GET_ROWS) {
+        ggml_cuda_topk_qsa_args args;
+        const int nodes_to_skip = ggml_cuda_try_topk_qsa_fusion(cuda_ctx, cgraph, i, args);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;

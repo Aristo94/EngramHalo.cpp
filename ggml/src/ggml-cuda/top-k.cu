@@ -208,6 +208,132 @@ static void top_k_radix_cuda(
             src, dst, states, ncols, k, blocks_per_row);
 }
 
+// QSA indexer fused top-k: selects over the virtual expanded tensor
+//   expanded[c, t, s] = score_blk[cell_blk[c, s], t, s] + addend[c, t, s]
+// so the [n_kv, n_tps, n_stream] expansion is never materialized. The radix
+// passes and tie behavior match top_k_radix_cuda; the fetch is the same
+// single f32 add as the unfused expand+add chain, so the selection
+// is bit-identical.
+struct ggml_cuda_topk_qsa_vals {
+    const float * score; // [n_blocks, n_tps, n_stream]
+    const int *   cell;  // [n_kv, n_stream]
+    const void *  add;   // [n_kv, n_tps, n_stream], f32 or f16
+    int n_blocks;
+    int n_tps;
+    int n_stream;
+    int n_kv;
+};
+
+template<int ADD_MODE> // 0 = none, 1 = f32, 2 = f16
+static __device__ __forceinline__ float top_k_qsa_fetch(const ggml_cuda_topk_qsa_vals & v, int row, int col) {
+    const int s   = row / v.n_tps;
+    const int b   = v.cell[(size_t) col * v.n_stream + s];
+    float     res = v.score[(size_t) row * v.n_blocks + b];
+    if (ADD_MODE == 1) {
+        res += ((const float *) v.add)[col + (size_t) row * v.n_kv];
+    } else if (ADD_MODE == 2) {
+        res += __half2float(((const __half *) v.add)[col + (size_t) row * v.n_kv]);
+    }
+    return res;
+}
+
+template<int BLOCK_SIZE, int RADIX_BITS, int ADD_MODE>
+static __global__ void top_k_radix_histogram_qsa(
+        const ggml_cuda_topk_qsa_vals vals,
+        const top_k_radix_state * __restrict__ states,
+        int * __restrict__ block_histograms,
+        int ncols,
+        int blocks_per_row,
+        int shift) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+
+    const int row = blockIdx.x / blocks_per_row;
+    const int row_block = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    __shared__ int histogram[NBINS];
+
+    histogram[tid] = 0;
+    __syncthreads();
+
+    const top_k_radix_state state = states[row];
+    for (int col = row_block * BLOCK_SIZE + tid;
+         col < ncols;
+         col += blocks_per_row * BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(top_k_qsa_fetch<ADD_MODE>(vals, row, col));
+        if ((key & state.prefix_mask) == state.prefix) {
+            atomicAdd(&histogram[(key >> shift) & (NBINS - 1)], 1);
+        }
+    }
+    __syncthreads();
+
+    const size_t histogram_offset =
+        ((size_t) row * blocks_per_row + row_block) * NBINS;
+    block_histograms[histogram_offset + tid] = histogram[tid];
+}
+
+template<int BLOCK_SIZE, int ADD_MODE>
+static __global__ void top_k_radix_gather_qsa(
+        const ggml_cuda_topk_qsa_vals vals,
+        int * __restrict__ dst,
+        top_k_radix_state * __restrict__ states,
+        int ncols,
+        int k,
+        int blocks_per_row) {
+    const int row = blockIdx.x / blocks_per_row;
+    const int row_block = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    int * row_dst = dst + (size_t) row * k;
+    top_k_radix_state * state = &states[row];
+
+    for (int col = row_block * BLOCK_SIZE + tid;
+         col < ncols;
+         col += blocks_per_row * BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(top_k_qsa_fetch<ADD_MODE>(vals, row, col));
+        if (key > state->prefix) {
+            const int pos = atomicAdd(&state->greater_count, 1);
+            row_dst[pos] = col;
+        } else if (key == state->prefix) {
+            const int pos = atomicAdd(&state->equal_count, 1);
+            if (pos < state->rank) {
+                row_dst[k - state->rank + pos] = col;
+            }
+        }
+    }
+}
+
+template<int ADD_MODE>
+static void top_k_radix_qsa_cuda(
+        ggml_cuda_pool & pool,
+        const ggml_cuda_topk_qsa_vals vals,
+        int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int RADIX_BITS = 8;
+    constexpr int NBINS = 1 << RADIX_BITS;
+    const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
+
+    ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, nrows);
+    ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
+    top_k_radix_state * states = states_alloc.get();
+    int * histograms = histograms_alloc.get();
+
+    top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
+
+    const dim3 row_grid(blocks_per_row * nrows);
+    for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        top_k_radix_histogram_qsa<BLOCK_SIZE, RADIX_BITS, ADD_MODE>
+            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                vals, states, histograms, ncols, blocks_per_row, shift);
+        top_k_radix_select<BLOCK_SIZE, RADIX_BITS>
+            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
+    }
+
+    top_k_radix_reset_counters
+        <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
+    top_k_radix_gather_qsa<BLOCK_SIZE, ADD_MODE>
+        <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+            vals, dst, states, ncols, k, blocks_per_row);
+}
+
 #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -273,3 +399,34 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #endif // defined(GGML_USE_HIP)
 #endif
 }
+
+#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+void ggml_cuda_op_top_k_qsa(ggml_backend_cuda_context & ctx, const ggml_cuda_topk_qsa_args & args, ggml_tensor * dst) {
+    const ggml_cuda_topk_qsa_vals vals {
+        args.score_blk, args.cell_blk, args.addend,
+        args.n_blocks, args.n_tps, args.n_stream, args.n_kv,
+    };
+
+    const int64_t nrows = (int64_t) args.n_tps * args.n_stream;
+    const int     k     = (int) dst->ne[0];
+
+    // the result cannot be written straight to dst: the allocator may have
+    // placed dst over score_blk/cell_blk/addend, which the graph declares dead
+    // at the expand. a pool buffer plus a device copy keeps the write ordered
+    // after the last read for any buffer layout.
+    ggml_cuda_pool &          pool = ctx.pool();
+    ggml_cuda_pool_alloc<int> dst_alloc(pool, (size_t) nrows * k);
+    int *                     tmp_dst = dst_alloc.get();
+
+    if (args.addend == nullptr) {
+        top_k_radix_qsa_cuda<0>(pool, vals, tmp_dst, args.n_kv, nrows, k, ctx.stream());
+    } else if (args.add_f16) {
+        top_k_radix_qsa_cuda<2>(pool, vals, tmp_dst, args.n_kv, nrows, k, ctx.stream());
+    } else {
+        top_k_radix_qsa_cuda<1>(pool, vals, tmp_dst, args.n_kv, nrows, k, ctx.stream());
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(dst->data, tmp_dst, (size_t) nrows * k * sizeof(int),
+                               cudaMemcpyDeviceToDevice, ctx.stream()));
+}
+#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
