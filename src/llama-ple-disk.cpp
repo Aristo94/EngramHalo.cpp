@@ -6,15 +6,19 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
 #include <cerrno>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -37,14 +41,21 @@ struct llama_ple_disk::impl {
     std::vector<uint8_t> slab;
 
     // per-gather scratch, reused
-    std::vector<int32_t>                       uniq;
-    std::vector<uint8_t>                       raw;      // [uniq.size(), rs]
-    std::vector<std::pair<int32_t, uint32_t>>  misses;   // (row, index into uniq)
-    uint8_t *                                  bounce0 = nullptr; // main-thread bounce buffer
+    std::vector<std::pair<int32_t, uint32_t>>  order;    // (row, position in idx) sorted by row: equal rows are adjacent
+    std::vector<uint32_t>                      runs;     // order[runs[u]..runs[u+1]) are the positions of distinct row u
+    std::vector<uint8_t>                       raw;      // [distinct rows, rs]
+    std::vector<std::pair<int32_t, uint32_t>>  misses;   // (row, index into raw)
+    float *                                    dst     = nullptr; // destination of the gather in progress
+    const uint8_t *                            src_full = nullptr; // preloaded table while a gather reads from it
+    uint8_t *                                  bounce0 = nullptr; // calling-thread bounce buffer
 
     std::mutex mtx; // one gather at a time; a model is shared by every context built on it
 
-    // reader pool, started on first use
+    // worker pool, started on first use; a job is n_items items handed out `grain` at a time
+    enum class job_kind { read, dequant };
+    job_kind                 job       = job_kind::read;
+    size_t                   n_items   = 0;
+    size_t                   grain     = 1;
     int32_t                  n_threads = 1;
     std::vector<std::thread> workers;
     std::mutex               pm;
@@ -54,6 +65,14 @@ struct llama_ple_disk::impl {
     size_t                   pending = 0;
     std::atomic<size_t>      next{0};
     bool                     stop    = false;
+
+    // LLAMA_PLE_PRELOAD=1: the whole table is read once into anonymous (huge-page) RAM by background threads; once
+    // complete, gathers dequantize straight from it (no syscalls, no cold reads)
+    uint8_t *           full_map   = nullptr;   // mmap base (page aligned, covers the aligned span of the table)
+    size_t              full_len   = 0;
+    const uint8_t *     full_rows  = nullptr;   // row 0 of the table inside full_map
+    std::atomic<bool>   full_ready{false};
+    std::thread         full_loader;
 
     uint64_t st_calls = 0, st_rows = 0, st_uniq = 0, st_hits = 0, st_reads = 0, st_bytes = 0;
     double   st_ms = 0;
@@ -107,7 +126,13 @@ struct llama_ple_disk::impl {
         }
 
         n_threads = std::max<int32_t>(1, p.n_threads);
+        if (const char * e = getenv("LLAMA_PLE_THREADS")) {
+            n_threads = std::max(1, atoi(e));
+        }
 
+        if (getenv("LLAMA_PLE_PRELOAD") && atoi(getenv("LLAMA_PLE_PRELOAD")) != 0) {
+            start_preload();
+        }
         if (p.cache_bytes >= rs) {
             size_t n = p.cache_bytes / rs;
             n_slots = 1;
@@ -123,6 +148,12 @@ struct llama_ple_disk::impl {
 
     ~impl() {
 #if !defined(_WIN32)
+        if (full_loader.joinable()) {
+            full_loader.join();
+        }
+        if (full_map) {
+            munmap(full_map, full_len);
+        }
         {
             std::lock_guard<std::mutex> lk(pm);
             stop = true;
@@ -139,6 +170,89 @@ struct llama_ple_disk::impl {
     }
 
 #if !defined(_WIN32)
+    void start_preload() {
+        const size_t pg   = 4096;
+        const off_t  a0   = (off_t) offs & ~(off_t) (pg - 1);
+        const size_t need = (size_t) ((off_t) offs - a0) + (size_t) nrows * rs;
+        full_len = ((need + (2u << 20) - 1) / (2u << 20)) * (2u << 20);
+        void * m = mmap(nullptr, full_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (m == MAP_FAILED) {
+            LLAMA_LOG_WARN("llama_ple_disk: preload mmap of %zu bytes failed (%s)\n", full_len, strerror(errno));
+            full_len = 0;
+            return;
+        }
+        full_map = (uint8_t *) m;
+#if defined(MADV_HUGEPAGE)
+        madvise(full_map, full_len, MADV_HUGEPAGE);   // 2 MiB pages: 27 GB of 4 KiB pages would fragment the GTT pool
+#endif
+        full_rows = full_map + ((off_t) offs - a0);
+        const std::string path = fname;
+        full_loader = std::thread([this, path, a0, need]() {
+            const auto t0 = std::chrono::steady_clock::now();
+            int dfd = -1;
+#if defined(O_DIRECT)
+            dfd = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);   // keeps the 27 GB out of the page cache
+#endif
+            const bool dio = dfd >= 0;
+            if (!dio) {
+                dfd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            }
+            if (dfd < 0) {
+                LLAMA_LOG_WARN("llama_ple_disk: preload open failed (%s)\n", strerror(errno));
+                return;
+            }
+            const size_t chunk = 64u << 20;
+            const size_t n_chunks = (need + chunk - 1) / chunk;
+            std::atomic<size_t> next_chunk{0};
+            std::atomic<bool>   failed{false};
+            auto reader = [&]() {
+                for (;;) {
+                    const size_t c = next_chunk.fetch_add(1);
+                    if (c >= n_chunks || failed) {
+                        break;
+                    }
+                    size_t len = std::min(chunk, need - c * chunk);
+                    if (dio) {
+                        len = ((len + 4095) / 4096) * 4096;
+                    }
+                    size_t got = 0;
+                    while (got < len) {
+                        const ssize_t r = pread(dfd, full_map + c * chunk + got, len - got, a0 + (off_t) (c * chunk + got));
+                        if (r < 0 && errno == EINTR) {
+                            continue;
+                        }
+                        if (r <= 0) {
+                            break;
+                        }
+                        got += (size_t) r;
+                    }
+                    if (got < std::min(chunk, need - c * chunk)) {
+                        failed = true;
+                    }
+                }
+            };
+            std::vector<std::thread> rt;
+            for (int t = 0; t < 8; ++t) {
+                rt.emplace_back(reader);
+            }
+            for (auto & t : rt) {
+                t.join();
+            }
+            close(dfd);
+            if (failed) {
+                LLAMA_LOG_WARN("llama_ple_disk: preload of %s failed, staying on pread\n", path.c_str());
+                return;
+            }
+            full_ready = true;
+            LLAMA_LOG_INFO("llama_ple_disk: preloaded %.2f GiB in %.1f s (%s)\n", need / (1024.0 * 1024.0 * 1024.0),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), dio ? "direct" : "buffered");
+            if (getenv("LLAMA_PLE_STATS")) {
+                fprintf(stderr, "ple_preload: done %.2f GiB in %.1f s\n", need / (1024.0 * 1024.0 * 1024.0),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+        });
+    }
+
     size_t bounce_size() const {
         return ((rs + block - 1) / block) * block + 2 * block;
     }
@@ -187,6 +301,37 @@ struct llama_ple_disk::impl {
         memcpy(dst, bounce + (off - a0), rs);
     }
 
+    // dequantize distinct row u into the first position that asked for it, then copy it to the others
+    void dequant_row(size_t u) const {
+        const uint8_t * src   = src_full ? src_full + (size_t) order[runs[u]].first * rs : raw.data() + u * rs;
+        float *         first = dst + (size_t) order[runs[u]].second * ne0;
+        if (to_float) {
+            to_float(src, first, ne0);
+        } else {
+            memcpy(first, src, rs);
+        }
+        for (uint32_t j = runs[u] + 1; j < runs[u + 1]; ++j) {
+            memcpy(dst + (size_t) order[j].second * ne0, first, (size_t) ne0 * sizeof(float));
+        }
+    }
+
+    void run_items(uint8_t * bounce) {
+        for (;;) {
+            const size_t i0 = next.fetch_add(grain);
+            if (i0 >= n_items) {
+                break;
+            }
+            const size_t i1 = std::min(i0 + grain, n_items);
+            for (size_t i = i0; i < i1; ++i) {
+                if (job == job_kind::read) {
+                    read_row(misses[i].first, raw.data() + (size_t) misses[i].second * rs, bounce);
+                } else {
+                    dequant_row(i);
+                }
+            }
+        }
+    }
+
     void worker() {
         uint8_t * bounce = direct ? alloc_bounce() : nullptr;
         uint64_t  seen   = 0;
@@ -199,13 +344,7 @@ struct llama_ple_disk::impl {
                 }
                 seen = gen;
             }
-            for (;;) {
-                const size_t i = next.fetch_add(1);
-                if (i >= misses.size()) {
-                    break;
-                }
-                read_row(misses[i].first, raw.data() + (size_t) misses[i].second * rs, bounce);
-            }
+            run_items(bounce);
             {
                 std::lock_guard<std::mutex> lk(pm);
                 if (--pending == 0) {
@@ -216,14 +355,18 @@ struct llama_ple_disk::impl {
         free(bounce);
     }
 
-    void run_misses() {
-        if (n_threads <= 1 || misses.size() <= 2) {
-            if (direct && bounce0 == nullptr) {
-                bounce0 = alloc_bounce();
-            }
-            for (const auto & m : misses) {
-                read_row(m.first, raw.data() + (size_t) m.second * rs, bounce0);
-            }
+    // run `kind` over n items; up to serial_max of them stay on the calling thread,
+    // which otherwise works alongside the pool instead of waiting for it
+    void run_job(job_kind kind, size_t n, size_t g, size_t serial_max) {
+        job     = kind;
+        n_items = n;
+        grain   = g;
+        if (direct && bounce0 == nullptr) {
+            bounce0 = alloc_bounce();
+        }
+        if (n_threads <= 1 || n <= serial_max) {
+            next = 0;
+            run_items(bounce0);
             return;
         }
         if (workers.empty()) {
@@ -239,37 +382,66 @@ struct llama_ple_disk::impl {
             ++gen;
         }
         cv_work.notify_all();
+        run_items(bounce0);
         std::unique_lock<std::mutex> lk(pm);
         cv_done.wait(lk, [&] { return pending == 0; });
     }
 
-    void gather(const int32_t * idx, size_t n, float * dst) {
+    void gather(const int32_t * idx, size_t n, float * out) {
         std::lock_guard<std::mutex> lk(mtx);
         const auto t0 = std::chrono::steady_clock::now();
+        GGML_ASSERT(n < UINT32_MAX);
 
-        uniq.assign(idx, idx + n);
-        std::sort(uniq.begin(), uniq.end());
-        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
-        if (!uniq.empty() && (uniq.front() < 0 || (int64_t) uniq.back() >= nrows)) {
-            GGML_ABORT("llama_ple_disk: row index out of range (%d..%d of %lld rows)",
-                       uniq.front(), uniq.back(), (long long) nrows);
+        // sort the positions by row so equal rows are adjacent: each distinct row is read and dequantized once
+        order.resize(n);
+        for (size_t k = 0; k < n; ++k) {
+            order[k] = { idx[k], (uint32_t) k };
         }
+        std::sort(order.begin(), order.end());
+        if (n && (order.front().first < 0 || (int64_t) order.back().first >= nrows)) {
+            GGML_ABORT("llama_ple_disk: row index out of range (%d..%d of %lld rows)",
+                       order.front().first, order.back().first, (long long) nrows);
+        }
+        runs.clear();
+        for (size_t k = 0; k < n; ++k) {
+            if (k == 0 || order[k].first != order[k - 1].first) {
+                runs.push_back((uint32_t) k);
+            }
+        }
+        const size_t n_uniq = runs.size();
+        runs.push_back((uint32_t) n);
 
-        raw.resize(uniq.size() * rs);
+        if (full_ready.load(std::memory_order_acquire)) {
+            const auto t_dq0 = std::chrono::steady_clock::now();
+            dst = out; src_full = full_rows;
+            run_job(job_kind::dequant, n_uniq, 64, 256);
+            dst = nullptr; src_full = nullptr;
+            st_calls += 1; st_rows += n; st_uniq += n_uniq; st_hits += n_uniq;
+            const auto t_end = std::chrono::steady_clock::now();
+            st_ms += std::chrono::duration<double, std::milli>(t_end - t0).count();
+            if (getenv("LLAMA_PLE_STATS")) {
+                fprintf(stderr, "ple_gather: rows %zu uniq %zu preloaded | sort %.1f ms dequant %.1f ms\n", n, n_uniq,
+                    std::chrono::duration<double, std::milli>(t_dq0 - t0).count(), std::chrono::duration<double, std::milli>(t_end - t_dq0).count());
+            }
+            return;
+        }
+        raw.resize(n_uniq * rs);
         misses.clear();
-        for (size_t i = 0; i < uniq.size(); ++i) {
+        for (size_t u = 0; u < n_uniq; ++u) {
+            const int32_t row = order[runs[u]].first;
             if (n_slots) {
-                const size_t slot = (size_t) uniq[i] & mask;
-                if (tags[slot] == uniq[i]) {
-                    memcpy(raw.data() + i * rs, slab.data() + slot * rs, rs);
+                const size_t slot = (size_t) row & mask;
+                if (tags[slot] == row) {
+                    memcpy(raw.data() + u * rs, slab.data() + slot * rs, rs);
                     continue;
                 }
             }
-            misses.emplace_back(uniq[i], (uint32_t) i);
+            misses.emplace_back(row, (uint32_t) u);
         }
 
+        const auto t_read0 = std::chrono::steady_clock::now();
         if (!misses.empty()) {
-            run_misses();
+            run_job(job_kind::read, misses.size(), 1, 2);
             if (n_slots) {
                 for (const auto & m : misses) {
                     const size_t slot = (size_t) m.first & mask;
@@ -279,21 +451,22 @@ struct llama_ple_disk::impl {
             }
         }
 
-        for (size_t k = 0; k < n; ++k) {
-            const size_t    i   = (size_t) (std::lower_bound(uniq.begin(), uniq.end(), idx[k]) - uniq.begin());
-            const uint8_t * src = raw.data() + i * rs;
-            float *         out = dst + k * (size_t) ne0;
-            if (to_float) {
-                to_float(src, out, ne0);
-            } else {
-                memcpy(out, src, rs);
-            }
+        const auto t_dq0 = std::chrono::steady_clock::now();
+        dst = out;
+        run_job(job_kind::dequant, n_uniq, 64, 256);
+        dst = nullptr;
+        static const bool stats = getenv("LLAMA_PLE_STATS") != nullptr;
+        if (stats) {
+            const auto t_end = std::chrono::steady_clock::now();
+            auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            fprintf(stderr, "ple_gather: rows %zu uniq %zu hits %zu reads %zu | sort %.1f ms read %.1f ms dequant %.1f ms total %.1f ms (%d threads)\n",
+                    n, n_uniq, n_uniq - misses.size(), misses.size(), ms(t0, t_read0), ms(t_read0, t_dq0), ms(t_dq0, t_end), ms(t0, t_end), n_threads);
         }
 
         st_calls += 1;
         st_rows  += n;
-        st_uniq  += uniq.size();
-        st_hits  += uniq.size() - misses.size();
+        st_uniq  += n_uniq;
+        st_hits  += n_uniq - misses.size();
         st_reads += misses.size();
         st_bytes += misses.size() * (direct ? block : rs);
         st_ms    += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -321,6 +494,31 @@ void llama_ple_disk::gather(const int32_t * idx, size_t n, float * dst) {
     pimpl->gather(idx, n, dst);
 #endif
 }
+
+void llama_ple_disk::prefetch(const int32_t * idx, size_t n) const {
+#if defined(_WIN32)
+    GGML_UNUSED(idx); GGML_UNUSED(n);
+#else
+    if (pimpl->direct || pimpl->fd < 0 || n == 0) {
+        return;
+    }
+    std::vector<int32_t> uniq;
+    uniq.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (idx[i] >= 0 && (int64_t) idx[i] < pimpl->nrows) {
+            uniq.push_back(idx[i]);
+        }
+    }
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    for (const int32_t row : uniq) {
+        const off_t off = (off_t) pimpl->offs + (off_t) row * (off_t) pimpl->rs;
+        posix_fadvise(pimpl->fd, off, (off_t) pimpl->rs, POSIX_FADV_WILLNEED);
+    }
+#endif
+}
+
+bool llama_ple_disk::page_cached() const { return !pimpl->direct; }
 
 int64_t llama_ple_disk::n_rows()   const { return pimpl->nrows; }
 int64_t llama_ple_disk::ne0()      const { return pimpl->ne0;   }

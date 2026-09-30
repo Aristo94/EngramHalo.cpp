@@ -49,6 +49,14 @@ struct ggml_cuda_hc_combine_norm_args {
     float               s1, b1, s2, b2;
     float               eps;
     bool                single_block = false; // alias-proof variant: one block per token, all inputs read before any store (hc <= 4)
+    // BF16 stream options (HC16): a BF16 copy of xn for consumers that read it, and BF16 in-place residual / block_out
+    uint16_t *          out_xn_bf16  = nullptr;
+    bool                store_xn_f32 = true;     // false: every consumer reads the BF16 copy
+    const uint16_t *    res_in_bf16  = nullptr;   // `residual` is BF16 in place (marked bf16-only)
+    const uint16_t *    blk_in_bf16  = nullptr;
+    uint16_t *          res_out_bf16 = nullptr;
+    const ggml_tensor * w_inject     = nullptr;   // [hc * n_embd, hc] F32 weight
+    ggml_tensor *       out_inject   = nullptr;   // [hc, T] F32, the skipped MUL_MAT node
 };
 
 bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);

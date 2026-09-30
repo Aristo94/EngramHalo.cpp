@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -153,7 +154,8 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    // a qwen4exp draft head shipped without its embeddings and LM head borrows them from the target context
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -373,6 +375,16 @@ llama_context::llama_context(
             }
         }
 
+        // the CUDA/HIP BF16 WMMA matmul path (mmb) is tuned for qwen4exp: other archs keep MMQ
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto * set_mmb_fn = reg ? (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_enabled") : nullptr;
+            if (set_mmb_fn) {
+                set_mmb_fn(backend.get(), model.arch == LLM_ARCH_QWEN4EXP);
+            }
+        }
+
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
         // graph outputs buffer
@@ -461,6 +473,14 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        // the draft vocabulary subset belongs to this context; contexts that ask for the same N share one copy
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.mtp_draft_vocab > 0) {
+            mtp_draft = model.mtp_draft_vocab_get(params.mtp_draft_vocab);
+            if (mtp_draft) {
+                cparams.mtp_draft_vocab = mtp_draft->n_keep;
+            }
         }
 
         sched_reserve();
@@ -1737,6 +1757,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+
+    {   // warm the page cache for this batch's per-layer-embedding rows while the first chunk is on the GPU;
+        // posix_fadvise only, so a wrong prediction costs readahead and nothing else
+        extern void qwen4exp_ple_prefetch(const llama_model & model, const llama_token * tokens, int32_t n_tokens);
+        if (model.arch == LLM_ARCH_QWEN4EXP && batch_inp.token && batch_inp.n_tokens >= 4096) {
+            qwen4exp_ple_prefetch(model, batch_inp.token, batch_inp.n_tokens);
+        }
+    }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     if (output_all) {
@@ -2512,6 +2540,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
+        /*.mtp_draft   =*/ mtp_draft.get(),
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -2539,6 +2568,7 @@ ggml_status llama_context::graph_compute(
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
+        if (auto * qsa = dynamic_cast<llama_memory_hybrid_idx *>(memory.get())) { qsa->qsa_invalidate(); }
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
@@ -3652,6 +3682,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.mtp_draft_vocab             =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

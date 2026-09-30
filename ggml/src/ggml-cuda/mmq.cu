@@ -183,8 +183,11 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const int si1  = ids->nb[1] / ggml_element_size(ids);
     const int sis1 = src1->nb[2] / src1->nb[1];
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-        src0->ne[2], n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+    if (!ggml_cuda_launch_mm_ids_bounded(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            src0->ne[2], n_tokens, n_expert_used, src1->ne[1], si1, sis1, dedup_bcast, stream)) {
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            src0->ne[2], n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     size_t nbytes_src1_q8_1 = n_tokens*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ;
@@ -372,8 +375,11 @@ static void ggml_cuda_mul_mat_q_impl(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        if (!ggml_cuda_launch_mm_ids_bounded(ctx, (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                ne02, ne12, n_expert_used, ne11, si1, sis1, dedup_bcast, stream)) {
+            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -560,6 +566,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 case GGML_TYPE_Q2_K:
                     return ne11 <= 128;
                 case GGML_TYPE_Q6_K:
+                    // RDNA 3.5 (gfx1151): dequantize + hipBLASLt loses to MMQ up to ne11 = 1024; at 2048 the two
+                    // paths trade places per shape (K = 4096 favours hipBLASLt, K >= 12288 favours MMQ), see PR.
+                    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+                        return ne11 <= 1024;
+                    }
                     return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:

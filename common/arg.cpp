@@ -2300,14 +2300,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_sampling());
     add_opt(common_arg(
         {"-j", "--json-schema"}, "SCHEMA",
-        "JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object\nFor schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead",
+        "JSON schema to constrain generations (https://json-schema.org/), e.g. `{\"type\": \"object\"}` for any JSON object",
         [](common_params & params, const std::string & value) {
             params.sampling.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(json::parse(value))};
         }
     ).set_sampling());
     add_opt(common_arg(
         {"-jf", "--json-schema-file"}, "FILE",
-        "File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object\nFor schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead",
+        "File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{\"type\": \"object\"}` for any JSON object",
         [](common_params & params, const std::string & value) {
             std::ifstream file(value);
             if (!file) {
@@ -2729,10 +2729,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
+        "- on-direct: like on, but the arch reads the rows with explicit pread()s instead of demand paging the mmap (currently only PLE tables, page-cached)\n"
         "- auto: on, but only for tensors larger than 4 GiB\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
+            else if (value == "on-direct") { params.lazy_mode = LLAMA_LAZY_MODE_DIRECT; }
             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
             else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
             else { throw std::invalid_argument("invalid value"); }
@@ -2777,35 +2779,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
         {"--ngram-on-disk"},
-        "keep the model's n-gram hash-embedding table (per_layer_token_embd, 28.8 GB on Qwen3.8-Flash-Next)\n"
-        "on disk: it is never mapped or loaded, each batch reads just the rows it gathers from the GGUF.\n"
-        "Only qwen4exp has such a table; on any other model this is a no-op",
+        "deprecated alias for --lazy-mode on",
         [](common_params & params) {
-            params.ple_on_disk = true;
+            params.lazy_mode = LLAMA_LAZY_MODE_ON;
         }
     ).set_env("LLAMA_ARG_NGRAM_ON_DISK"));
-    add_opt(common_arg(
-        {"--ngram-io-threads"}, "N",
-        string_format("threads reading n-gram rows for --ngram-on-disk (default: %d)", params.ple_io_threads),
-        [](common_params & params, int value) {
-            params.ple_io_threads = value;
-        }
-    ).set_env("LLAMA_ARG_NGRAM_IO_THREADS"));
-    add_opt(common_arg(
-        {"--ngram-cache"}, "MiB",
-        string_format("in-memory cache of recently read n-gram rows for --ngram-on-disk, 0 disables (default: %d)", params.ple_cache_mb),
-        [](common_params & params, int value) {
-            params.ple_cache_mb = value;
-        }
-    ).set_env("LLAMA_ARG_NGRAM_CACHE"));
-    add_opt(common_arg(
-        {"--ngram-direct-io"},
-        {"--no-ngram-direct-io"},
-        string_format("read n-gram rows with O_DIRECT so they bypass the page cache (default: %s)", params.ple_direct_io ? "enabled" : "disabled"),
-        [](common_params & params, bool value) {
-            params.ple_direct_io = value;
-        }
-    ).set_env("LLAMA_ARG_NGRAM_DIRECT_IO"));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
@@ -4028,7 +4006,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--no-log-jsonl"},
         "Log as JSONL (one JSON object per line) to stdout, this also disables colored logging (default: disabled)",
         [](common_params &, bool value) {
-            common_log_set_jsonl(common_log_main(), value);
+            common_log_set_jsonl(value);
         }
     ).set_env("LLAMA_ARG_LOG_JSONL"));
     add_opt(common_arg(
@@ -4293,6 +4271,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.adaptive = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-vocab"}, "N",
+        string_format("MTP: compute draft logits over token ids < N plus control tokens only; verification is unchanged "
+                      "(0 = full vocabulary, default: %d)", params.speculative.draft.mtp_vocab),
+        [](common_params & params, int value) {
+            params.speculative.draft.mtp_vocab = std::max(0, value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),

@@ -236,6 +236,7 @@ extern "C" {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+        LLAMA_LAZY_MODE_DIRECT = 3, // like on, but the arch reads the rows with explicit pread()s instead of demand paging the mmap (currently only PLE tables)
     };
 
     enum llama_context_type {
@@ -344,10 +345,6 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
-        // n-gram hash-embedding table kept on disk (see ple_on_disk below)
-        int32_t ple_io_threads; // parallel pread workers
-        int32_t ple_cache_mb;   // in-memory cache of recently read rows, 0 disables
-
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
@@ -369,9 +366,6 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
-        bool ple_on_disk;     // keep the n-gram hash-embedding table (per_layer_token_embd) on disk: never
-                              // mapped or loaded, the rows a batch needs are read from the file (qwen4exp)
-        bool ple_direct_io;   // read those rows with O_DIRECT, bypassing the page cache
     };
 
     struct llama_sampler_seq_config {
@@ -391,6 +385,7 @@ extern "C" {
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
+        int32_t  mtp_draft_vocab;       // MTP contexts only: draft over token ids < N plus control tokens (0 = full vocabulary) [EXPERIMENTAL]
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`

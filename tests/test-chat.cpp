@@ -472,6 +472,12 @@ static common_chat_tool empty_args_tool_no_properties{
     })",
 };
 
+static common_chat_tool empty_args_tool_no_schema{
+    /* .name = */ "empty_args_no_schema",
+    /* .description = */ "A tool that takes no arguments and has no parameters schema",
+    /* .parameters = */ "{}",
+};
+
 static common_chat_tool python_tool{
     /* .name = */ "python",
     /* .description = */ "an ipython interpreter",
@@ -837,6 +843,25 @@ static common_chat_tool nullable_int_tool{
             }
         },
         "required": ["count"]
+    })",
+};
+
+static common_chat_tool string_union_tool{
+    /* .name = */ "set_union",
+    /* .description = */ "Set values whose types are unions with string",
+    /* .parameters = */ R"({
+        "type": "object",
+        "properties": {
+            "value": {
+                "type": ["string", "object"],
+                "description": "A string or object value"
+            },
+            "amount": {
+                "type": ["string", "integer"],
+                "description": "A string or integer value"
+            }
+        },
+        "required": ["value", "amount"]
     })",
 };
 
@@ -3799,6 +3824,46 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             })
             .run();
 
+        // nullable string given null - parses as JSON null, not the string "null"
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_nullable_str>\n"
+               "<parameter=name>\nnull\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ nullable_string_tool })
+            .expect_tool_calls({
+                { "set_nullable_str", R"({"name": null})", {} },
+            })
+            .run();
+
+        // unions with string - JSON values of the other types are typed, everything else is a string
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_union>\n"
+               "<parameter=value>\n{\"a\": 1}\n</parameter>\n"
+               "<parameter=amount>\n2 dollars\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ string_union_tool })
+            .expect_tool_calls({
+                { "set_union", R"({"value": {"a": 1}, "amount": "2 dollars"})", {} },
+            })
+            .run();
+
+        tst.test(
+               "<tool_call>\n"
+               "<function=set_union>\n"
+               "<parameter=value>\n{not valid json\n</parameter>\n"
+               "<parameter=amount>\n42\n</parameter>\n"
+               "</function>\n"
+               "</tool_call>")
+            .tools({ string_union_tool })
+            .expect_tool_calls({
+                { "set_union", R"({"value": "{not valid json", "amount": 42})", {} },
+            })
+            .run();
+
         // enum without explicit type key - should infer string from enum values
         tst.test(
                "<tool_call>\n"
@@ -5069,6 +5134,13 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .enable_thinking(false)
             .tools({ empty_args_tool })
             .expect(simple_assist_msg("", "", "empty_args", "{}"))
+            .run();
+
+        // Tool call with no parameters schema, {} means no arguments
+        tst.test("<tool_call>\n{\"name\": \"empty_args_no_schema\", \"arguments\": {}}</tool_call>")
+            .enable_thinking(false)
+            .tools({ empty_args_tool_no_schema })
+            .expect(simple_assist_msg("", "", "empty_args_no_schema", "{}"))
             .run();
 
         // fake tool call marker in reasoning
@@ -7297,6 +7369,49 @@ static void test_msg_diffs_compute() {
     }
 }
 
+static void test_qwen_string_enums() {
+    const auto xml = [](const std::string & value) {
+        return "<tool_call>\n<function=records>\n<parameter=action>\n" + value +
+               "\n</parameter>\n</function>\n</tool_call>";
+    };
+    for (const std::string path : {"models/templates/Qwen3-Coder.jinja", "models/templates/Qwen3.5-4B.jinja"}) {
+        auto tmpls = read_templates(path);
+        common_chat_templates_inputs in;
+        in.messages = {message_user};
+        in.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        in.parallel_tool_calls = true;
+        auto schema = json::parse(R"({"type":"object","properties":{"action":{"type":"string","enum":["load","reload","re","","quoted\"value","line\nbreak"]}},"required":["action"],"additionalProperties":false})");
+        in.tools = {{"records", "Access records.", schema.dump()}};
+        auto params = common_chat_templates_apply(tmpls.get(), in);
+        for (const std::string value : {"erase", "loading", "reloaded", " load", "load "}) {
+            auto grammar = build_grammar(params.grammar);
+            assert_equals(true, grammar != nullptr);
+            assert_equals(false, match_string(xml(value), grammar.get()));
+        }
+        for (const auto & value : schema["properties"]["action"]["enum"]) {
+            const auto text = value.get<std::string>();
+            auto grammar = build_grammar(params.grammar);
+            assert_equals(true, match_string(xml(text), grammar.get()));
+            test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+                tc.params = in;
+                tc.input = (path.find("Qwen3-Coder") == std::string::npos ? "</think>\n\n" : "") + xml(text);
+                tc.expect = simple_assist_msg("", "", "records", json({{"action", text}}).dump());
+            }, false);
+        }
+        test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+            tc.params = in;
+            tc.input = (path.find("Qwen3-Coder") == std::string::npos ? "</think>\n\n" : "") + xml("re") + "\n" + xml("reload");
+            tc.expect.role = "assistant";
+            tc.expect.tool_calls = {{"records", R"({"action":"re"})", ""}, {"records", R"({"action":"reload"})", ""}};
+        }, false);
+        schema["properties"]["action"].erase("enum");
+        in.tools = {{"records", "Access records.", schema.dump()}};
+        params = common_chat_templates_apply(tmpls.get(), in);
+        auto grammar = build_grammar(params.grammar);
+        assert_equals(true, match_string(xml("erase"), grammar.get()));
+    }
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -7369,6 +7484,7 @@ int main(int argc, char ** argv) {
     } else
 #endif
     {
+        test_qwen_string_enums();
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
