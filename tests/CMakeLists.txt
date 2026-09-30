@@ -215,7 +215,57 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(
         test-recurrent-state-rollback
         LABEL main
-        ARGS --models "${MODEL_DIR}"
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-nemotron-h
+        LABEL main
+        ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-dsv4
+        LABEL main
+        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-kimi-k3
+        LABEL main
+        ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-qwen35moe
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-qwen35moe PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    # non-unified multi-seq decodes reach the QSA path with one stream per ubatch (#73)
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-qwen4exp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-qwen4exp PROPERTIES
+        FIXTURES_REQUIRED generate-models
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
 
