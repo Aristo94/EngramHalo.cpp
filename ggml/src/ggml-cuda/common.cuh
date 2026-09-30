@@ -725,6 +725,24 @@ static __device__ __forceinline__ uint32_t __hgt2_mask(const half2 a, const half
 }
 #endif // (defined(CUDART_VERSION) && CUDART_VERSION < CUDART_HMASK) || defined(GGML_USE_HIP) || (defined(MUSART_VERSION) && MUSART_VERSION < MUSART_HMASK)
 
+// Rounds x to a float in a register before its next use, so the compiler cannot contract it into the following add or multiply.
+static __device__ __forceinline__ float ggml_cuda_materialize(float x) {
+#if defined(GGML_USE_HIP)
+    asm volatile("" : "+v"(x));
+#else
+    volatile float v = x;
+    x = v;
+#endif // defined(GGML_USE_HIP)
+    return x;
+}
+
+// F32 -> BF16, round to nearest even: the rounding of the MMB activation conversion (mmb_cvt_f32_bf16).
+static __device__ __forceinline__ uint16_t ggml_cuda_f32_to_bf16_rne(const float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
 #if defined(GGML_USE_HIP)
 #if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)
@@ -1460,6 +1478,8 @@ struct ggml_cuda_stream_context {
     }
 };
 
+struct ggml_cuda_mmb_context;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1471,6 +1491,14 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+    ggml_cuda_mmb_context * mmb = nullptr;
+    bool mmb_opt_in = false; // set by ggml_backend_cuda_set_mmb_enabled, before the first graph
+    bool mmb_after_compute = true;
+    const void * mmb_first_split = nullptr;
+    std::vector<uint64_t> mmb_graph_sigs;
+    // HC residuals whose remaining readers live in a later split of the same graph on this device: tensor -> uses left
+    std::unordered_map<const ggml_tensor *, int> mmb_res16_pending;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

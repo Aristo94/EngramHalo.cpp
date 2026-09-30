@@ -149,8 +149,10 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build_and_test(test-qsa-prefix.cpp)
+llama_build_and_test(test-qsa-fast.cpp)
 llama_build_and_test(test-ple-disk.cpp)
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -243,6 +245,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/kimi-k3-moe.gguf"
     )
     set_tests_properties(test-recurrent-state-rollback-kimi-k3 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    # non-unified multi-seq decodes reach the QSA path with one stream per ubatch (#73)
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-qwen4exp
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-qwen4exp PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
 
