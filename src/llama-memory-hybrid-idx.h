@@ -13,6 +13,8 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
+// TODO: this memory module is pending complete reimplementation - do not use for model other than Qwen4
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -84,9 +86,10 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, bool causal_attn) const;
     // complete-block selection metadata: tails and, when the bias is I32, compact limits
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                               ggml_tensor * bias, ggml_tensor * tail_idxs,
@@ -109,7 +112,7 @@ private:
     // [n_seq x n_blocks starts] ++ [n_tps tails] ++ [n_tps row idx]
     void set_input_qsa_scan(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                             ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch,
-                            uint32_t ratio, bool blk_bias) const;
+                            uint32_t ratio, bool blk_bias, bool causal_attn) const;
     // closed-form block metadata on the tracked prefix for the compact I32 bias; false when the scan is needed
     bool qsa_metadata(ggml_tensor * cells, ggml_tensor * positions, ggml_tensor * bias,
                       ggml_tensor * tails, const llama_ubatch & ubatch, uint32_t ratio) const;
@@ -188,7 +191,7 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, bool causal_attn) const;
     void set_input_qsa_blocks(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                               ggml_tensor * bias, ggml_tensor * tail_idxs,
                               const llama_ubatch * ubatch, uint32_t ratio) const;

@@ -286,7 +286,7 @@ static int common_download_file_single_online(const std::string & url,
     static const int max_attempts        = 3;
     static const int retry_delay_seconds = 2;
 
-    const bool file_exists = std::filesystem::exists(path);
+    const bool file_exists = std::filesystem::exists(std::filesystem::u8path(path));
 
     if (file_exists && skip_etag) {
         LOG_DBG("%s: using cached file: %s\n", __func__, path.c_str());
@@ -477,7 +477,7 @@ int common_download_file_single(const std::string & url,
         return common_download_file_single_online(url, path, online_opts, skip_etag);
     }
 
-    if (!std::filesystem::exists(path)) {
+    if (!std::filesystem::exists(std::filesystem::u8path(path))) {
         LOG_ERR("%s: required file is not available in cache (offline mode): %s\n", __func__, path.c_str());
         return -1;
     }
@@ -943,7 +943,7 @@ std::string common_docker_resolve_model(const std::string & docker) {
         std::string model_filename = repo;
         std::replace(model_filename.begin(), model_filename.end(), '/', '_');
         model_filename += "_" + tag + ".gguf";
-        std::string local_path = fs_get_cache_file(model_filename);
+        std::string local_path = fs_path_to_utf8(fs_get_cache_file(model_filename));
 
         const std::string blob_url = url_prefix + "/blobs/" + gguf_digest;
         common_download_opts opts;
