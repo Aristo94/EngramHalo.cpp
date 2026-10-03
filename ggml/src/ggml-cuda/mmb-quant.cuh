@@ -17,6 +17,19 @@ struct mmb_quant_slice {
     __device__ element operator[](int64_t n) const { return {dst, offset + (int) n - begin}; }
 };
 
+__device__ __forceinline__ void mmb_store8(uint16_t * dst, const float * v) {
+    uint4 o; o.x = mmb_pack2(v[0], v[1]); o.y = mmb_pack2(v[2], v[3]); o.z = mmb_pack2(v[4], v[5]); o.w = mmb_pack2(v[6], v[7]);
+    *(uint4 *) dst = o;
+}
+
+// 8 weights of an IQ2/IQ3_XXS grid group: fp32 d * grid * sign as in dequantize_*, RNE to bf16, one 16-byte store
+__device__ __forceinline__ void mmb_store_grid8(uint16_t * dst, const uint64_t grid, const float d, const uint32_t signs) {
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = d * (float)((grid >> (8 * j)) & 0xff) * (signs & (1u << j) ? -1.f : 1.f);
+    mmb_store8(dst, v);
+}
+
 template <ggml_type TYPE>
 __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0, uint16_t * dst, const int lane) {
     constexpr int QK = ggml_cuda_type_traits<TYPE>::qk;
@@ -33,16 +46,15 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
         }
     }
     else if constexpr (TYPE == GGML_TYPE_Q2_0) {
-        constexpr int QR = ggml_cuda_type_traits<TYPE>::qr;
+        // QK = 64: the slice is one block, lane -> 8 consecutive weights (2 bytes of qs), (code - 1) * d as dequantize_q2_0
+        static_assert(QK == 64, "Q2_0 slice decode assumes one block per 64-wide K slice");
+        const block_q2_0 * x = (const block_q2_0 *) row + k0 / QK;
+        const float d = x->d;
+        const uint32_t q = x->qs[2 * lane] | (x->qs[2 * lane + 1] << 8);
+        float v[8];
 #pragma unroll
-        for (int p = lane; p < 32; p += 8) {
-            const int pos = k0 + 2 * p, ib = pos / QK, qs = (pos % QK) / QR;
-            float2 v;
-            dequantize_q2_0(row, ib, qs, v);
-            const int o = ib * QK + qs - k0;
-            dst[o] = mmb_f2bf(v.x);
-            dst[o + (QR == 1 ? 1 : QK / 2)] = mmb_f2bf(v.y);
-        }
+        for (int j = 0; j < 8; ++j) v[j] = ((int) ((q >> (2 * j)) & 3) - 1) * d;
+        mmb_store8(dst + 8 * lane, v);
     }
     else if constexpr (TYPE == GGML_TYPE_Q4_0) {
         constexpr int QR = ggml_cuda_type_traits<TYPE>::qr;
@@ -139,25 +151,38 @@ __device__ __forceinline__ void mmb_decode_slice(const void * row, const int k0,
 #pragma unroll
         for (int tid = lane; tid < 32; tid += 8) dequantize_iq1_m<float>(row, k0 / QK, out, tid);
     }
+    // IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS: a lane decodes 8-weight group (lane & 3) of 32-block ib0 + (lane >> 2)
     else if constexpr (TYPE == GGML_TYPE_IQ2_XXS) {
-        const mmb_quant_slice out{dst, k0 % QK};
-#pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq2_xxs<float>(row, k0 / QK, out, tid);
+        const block_iq2_xxs * x = (const block_iq2_xxs *) row + k0 / QK;
+        const int sub = lane >> 2, il = lane & 3, ib = (k0 % QK) / 32 + sub;
+        const uint16_t * q2 = x->qs + 4 * ib;
+        const uint32_t aux32 = q2[2] | (q2[3] << 16);
+        const float d = (float) x->d * (0.5f + (aux32 >> 28)) * 0.25f;
+        mmb_store_grid8(dst + 32 * sub + 8 * il, iq2xxs_grid[((const uint8_t *) q2)[il]], d, ksigns_iq2xs[(aux32 >> 7 * il) & 127]);
     }
     else if constexpr (TYPE == GGML_TYPE_IQ2_XS) {
-        const mmb_quant_slice out{dst, k0 % QK};
-#pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq2_xs<float>(row, k0 / QK, out, tid);
+        const block_iq2_xs * x = (const block_iq2_xs *) row + k0 / QK;
+        const int sub = lane >> 2, il = lane & 3, ib = (k0 % QK) / 32 + sub;
+        const uint16_t q2 = x->qs[4 * ib + il];
+        const float d = (float) x->d * (0.5f + ((x->scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+        mmb_store_grid8(dst + 32 * sub + 8 * il, iq2xs_grid[q2 & 511], d, ksigns_iq2xs[q2 >> 9]);
     }
     else if constexpr (TYPE == GGML_TYPE_IQ2_S) {
-        const mmb_quant_slice out{dst, k0 % QK};
-#pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq2_s<float>(row, k0 / QK, out, tid);
+        const block_iq2_s * x = (const block_iq2_s *) row + k0 / QK;
+        const int sub = lane >> 2, il = lane & 3, ib = (k0 % QK) / 32 + sub;
+        const float d = (float) x->d * (0.5f + ((x->scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+        mmb_store_grid8(dst + 32 * sub + 8 * il, iq2s_grid[x->qs[4 * ib + il] | ((x->qh[ib] << (8 - 2 * il)) & 0x300)], d,
+            x->qs[QK_K / 8 + 4 * ib + il]);
     }
     else if constexpr (TYPE == GGML_TYPE_IQ3_XXS) {
-        const mmb_quant_slice out{dst, k0 % QK};
-#pragma unroll
-        for (int tid = lane; tid < 32; tid += 8) dequantize_iq3_xxs<float>(row, k0 / QK, out, tid);
+        const block_iq3_xxs * x = (const block_iq3_xxs *) row + k0 / QK;
+        const int sub = lane >> 2, il = lane & 3, ib = (k0 % QK) / 32 + sub;
+        const uint8_t * q3 = x->qs + 8 * ib;
+        const uint16_t * gas = (const uint16_t *) (x->qs + QK_K / 4) + 2 * ib;
+        const uint32_t aux32 = gas[0] | (gas[1] << 16);
+        const float d = (float) x->d * (0.5f + (aux32 >> 28)) * 0.5f;
+        const uint64_t grid = iq3xxs_grid[q3[2 * il + 0]] | ((uint64_t) iq3xxs_grid[q3[2 * il + 1]] << 32);
+        mmb_store_grid8(dst + 32 * sub + 8 * il, grid, d, ksigns_iq2xs[(aux32 >> 7 * il) & 127]);
     }
     else if constexpr (TYPE == GGML_TYPE_IQ3_S) {
         // lane -> (il = lane>>1, ib = ib0 + (lane&1)): 8 consecutive weights, one 16-byte LDS store.
