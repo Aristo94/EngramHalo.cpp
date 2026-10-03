@@ -1,6 +1,6 @@
 #pragma once
 #include "common.cuh"
-// Quantized-weight BF16 WMMA GEMM on gfx1151, from 512 tokens up.
+// Quantized-weight BF16 WMMA GEMM on gfx1151, from 512 GEMM rows up, or 32 with the small-batch opt-in (see mmb_min_t).
 // Off unless the backend context opts in (ggml_backend_cuda_set_mmb_enabled).
 bool ggml_cuda_mmb_supported_mm  (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
@@ -29,6 +29,8 @@ bool ggml_cuda_mmb_f32_dual(ggml_backend_cuda_context & ctx, const ggml_tensor *
 bool ggml_cuda_mmb_down16();
 bool ggml_cuda_mmb_res16();
 bool ggml_cuda_mmb_blk16();
+// shape and type checks of ggml_cuda_hc_gate_mix (which also needs the BF16 xn copy)
+bool ggml_cuda_hc_gate_mix_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, const ggml_tensor * dst, int hc);
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst, int hc, float scale, float bias);
 bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu);
 void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);

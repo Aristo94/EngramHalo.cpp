@@ -165,8 +165,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to create per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
+| `--cache-dir PATH` | persist prompt cache state in this directory (not the model download cache) and restore it after server restart<br/>(env: LLAMA_ARG_CACHE_DIR) |
+| `--cache-dir-max N` | set the maximum persistent prompt cache size in MiB (default: -1, -1 - no limit, 0 - disable)<br/>(env: LLAMA_ARG_CACHE_DIR_MAX) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
-| `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
+| `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires a prompt cache)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
 | `-sp, --special` | special tokens output enabled (default: false) |
@@ -1152,6 +1154,54 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_accepted_tokens_total` | Counter | Total draft tokens accepted by the target model (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
+
+### GET `/dashboard`: Live stats dashboard
+
+A single self-contained page (no external resources, works offline, light/dark, phone-sized screens) that polls `/dashboard/stats` every 1.5 s and shows, per model:
+
+- decode and prefill tokens/s: live (running slots), last request, average since start, and a 10-minute throughput chart for each
+- speculative / MTP draft acceptance rate and mean accepted length (when a `--spec-type` is set)
+- slots and their state, prompt progress, KV/context usage per slot and in total, deferred (queued) requests
+- the last finished requests with their timings, and the model/configuration (file, size, type, architecture, context, KV cache type, speculative settings, PLE on disk)
+
+It needs no flag and is independent of the chat UI (it is also served with `--no-ui`). The page itself is public and holds no data; the JSON it reads requires the API key when `--api-key` is set (the page asks for it and keeps it in the browser's localStorage). No prompts or generated text are exposed.
+
+In *router mode* (`--models-preset` / `--models-dir`) the dashboard lists every model with its status (`loaded`, `sleeping`, `loading`, `unloaded`, failed) and shows the live stats of the running ones.
+
+### GET `/dashboard/stats`: Dashboard data
+
+Returns the data behind `/dashboard`. Polling it does not reset the `--sleep-idle-seconds` timer and does not wake a sleeping model (the stats from before sleep are returned). In router mode the router queries each running child (in parallel, 1.5 s timeout) and adds the models that are not running.
+
+```json
+{
+  "mode": "single",            // or "router"
+  "build_info": "b11336-2e63e11b6",
+  "t_now_ms": 1790946801345,
+  "models": [{
+    "id": "qwen35-2b",
+    "status": "loaded",        // loaded | sleeping | loading | unloaded | downloading
+    "info": {
+      "file": "Qwen3.5-2B-UD-Q4_K_XL.gguf", "arch": "qwen35", "ftype": "Q4_K - Medium",
+      "size_bytes": 1328790784, "n_params": 1881825088, "n_ctx_train": 262144,
+      "config": { "n_ctx": 8192, "n_ctx_slot": 4096, "n_parallel": 2, "cache_type_k": "f16",
+                  "speculative": { "types": "ngram-simple", "n_max": 3, "n_min": 0 }, "lazy_mode": "auto", ... }
+    },
+    "stats": {                 // null when the model is not running
+      "slots":  [{ "id": 0, "state": "generating", "n_ctx": 4096, "n_tokens": 118, "n_gen": 45,
+                   "prompt_tps": 126.0, "gen_tps": 20.9, "draft": { "acceptance": 0.06, "mean_accepted_len": 3.0, ... } }],
+      "kv":     { "n_ctx": 8192, "n_ctx_slot": 4096, "n_used": 226, "unified": false },
+      "queue":  { "n_slots": 2, "n_processing": 1, "n_deferred": 0 },
+      "totals": { "n_requests": 9, "n_prompt": 157, "n_gen": 779, "prompt_tps": 133.0, "gen_tps": 21.6,
+                  "draft": { "n_draft": 66, "n_accepted": 4, "acceptance": 0.06, "mean_accepted_len": 3.0, "acceptance_per_pos": [1.0, 1.0] } },
+      "recent": [{ "t_end_ms": 1790946821451, "id_slot": 0, "n_prompt": 20, "n_cached": 0, "n_gen": 111,
+                   "prompt_tps": 166.1, "gen_tps": 26.1, "draft": { ... }, "stop": "eos", "truncated": false }],
+      "series": { "period_s": 2.0, "t_ms": [...], "gen_tps": [...], "prompt_tps": [...] }   // last 10 minutes
+    }
+  }]
+}
+```
+
+`gen_tps` follows the server's timings (decode steps per second, the first token is excluded); `series` is the aggregate throughput over all slots in 2 s buckets; `recent` keeps the last 64 requests.
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 

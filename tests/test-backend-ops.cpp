@@ -1291,6 +1291,10 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+
+    // nodes the scheduler runs on the second backend: backend1 then computes in several splits, as llama does
+    // (needs use_scheduler_allocation(); the nodes to compare must be graph outputs)
+    virtual std::vector<ggml_tensor *> second_backend_nodes() { return {}; }
     virtual bool use_scheduler_allocation() { return false; }
     virtual bool use_weight_context() { return false; }
 
@@ -1484,6 +1488,9 @@ struct test_case {
             for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get()); tensor; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
                 ggml_backend_sched_set_tensor_backend(sched.get(), tensor, backend1);
             }
+            for (ggml_tensor * t : second_backend_nodes()) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), t, backend2);
+            }
             if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                 printf("failed to allocate graph through the scheduler [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
@@ -1575,9 +1582,29 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
-                                                               run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
-                                                               fused_nodes_to_verify.size());
+        bool cmp_ok = true;
+        if (!second_backend_nodes().empty()) {
+            // compute backend1's splits through the scheduler, the reference as one graph on backend2
+            struct ggml_backend_graph_copy copy = ggml_backend_graph_copy(backend2, gf);
+            cmp_ok = copy.buffer != nullptr && ggml_backend_sched_graph_compute(sched.get(), gf) == GGML_STATUS_SUCCESS &&
+                     ggml_backend_graph_compute(backend2, copy.graph) == GGML_STATUS_SUCCESS;
+            size_t n_cmp = 0;
+            for (int i = 0; cmp_ok && i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                if (std::find(fused_nodes_to_verify.begin(), fused_nodes_to_verify.end(), t) != fused_nodes_to_verify.end()) {
+                    callback(i, t, ggml_graph_node(copy.graph, i), &ud);
+                    ++n_cmp;
+                }
+            }
+            cmp_ok = cmp_ok && n_cmp == fused_nodes_to_verify.size();
+            if (copy.buffer) {
+                ggml_backend_graph_copy_free(copy);
+            }
+        } else {
+            cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                        run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                        fused_nodes_to_verify.size());
+        }
 
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
@@ -3924,19 +3951,42 @@ struct test_conv_state_chain : public test_case {
 
 struct test_mmb_quant_hc : test_case {
     const ggml_type type;
-    explicit test_mmb_quant_hc(ggml_type type) : type(type) {}
+    const ggml_type type_down; // GGML_TYPE_COUNT: lo is an input
+    const int k, hc, embd;
+    const bool gate_output;    // the gate GEMM is a graph output, compared with the result
+    const bool split_reader;   // a second reader of the gate GEMM in a later split (after a node on the second backend)
+    ggml_tensor * out_gate = nullptr, * out_mix = nullptr, * cut = nullptr;
+    explicit test_mmb_quant_hc(ggml_type type, ggml_type type_down = GGML_TYPE_COUNT, int k = 256, int hc = 4, int embd = 2560,
+                               bool gate_output = false, bool split_reader = false)
+        : type(type), type_down(type_down), k(k), hc(hc), embd(embd), gate_output(gate_output), split_reader(split_reader) {}
     std::string op_desc(ggml_tensor *) override { return "MMB_QUANT_HC"; }
-    std::string vars() override { return VAR_TO_STR(type); }
+    std::string vars() override {
+        std::string s = type_down == GGML_TYPE_COUNT ? VAR_TO_STR(type) : VARS_TO_STR2(type, type_down);
+        if (k != 256 || hc != 4 || embd != 2560) s += "," + VARS_TO_STR3(k, hc, embd);
+        if (gate_output) s += "," + VAR_TO_STR(gate_output);
+        if (split_reader) s += "," + VAR_TO_STR(split_reader);
+        return s;
+    }
     bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> second_backend_nodes() override { return split_reader ? std::vector<ggml_tensor *>{cut} : std::vector<ggml_tensor *>{}; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (!gate_output && !split_reader) return {};
+        std::vector<ggml_tensor *> v = {out_mix};
+        if (gate_output) v.push_back(out_gate);
+        return v;
+    }
     bool use_scheduler_allocation() override { return true; }
     void initialize_tensors(ggml_context * ctx) override {
         for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
-            if (t->op==GGML_OP_NONE) init_tensor_uniform(t);
+            if (t->op!=GGML_OP_NONE) continue;
+            // Scale down weights to avoid saturating the gate sigmoid.
+            const float r = strcmp(t->name, "w_down") == 0 ? 1.0f/sqrtf((float) t->ne[0]) : 1.0f;
+            init_tensor_uniform(t, -r, r);
         }
     }
     double max_nmse_err() override { return 5e-4; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int embd=2560, hc=4, tokens=512, k=256;
+        const int tokens=512;
         auto * residual=ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, hc, tokens);
         auto * block=ggml_new_tensor_3d(ctx, GGML_TYPE_F32, embd, 1, tokens);
         auto * injection=ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, tokens);
@@ -3947,13 +3997,31 @@ struct test_mmb_quant_hc : test_case {
         auto * combined=ggml_add(ctx,residual,ggml_mul(ctx,ggml_repeat(ctx,block,residual),weight));
         auto * xn=ggml_reshape_2d(ctx,ggml_mul(ctx,ggml_rms_norm(ctx,combined,1e-6f),gamma),embd*hc,tokens);
         if(gf)ggml_build_forward_expand(gf,xn);
-        auto * lo=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,k,tokens);
+        // with type_down, lo is the down projection of xn as the model builds it, so xn also has a GEMM reader
+        ggml_tensor * lo=nullptr;
+        if (type_down==GGML_TYPE_COUNT) {
+            lo=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,k,tokens);
+        } else {
+            auto * w_down=ggml_new_tensor_2d(ctx,type_down,embd*hc,k);
+            ggml_set_name(w_down,"w_down");
+            lo=ggml_silu(ctx,ggml_scale(ctx,ggml_mul_mat(ctx,w_down,xn),.25f));
+        }
         auto * w=ggml_new_tensor_2d(ctx,type,k,embd*hc);
-        auto * gate=ggml_sigmoid(ctx,ggml_mul_mat(ctx,w,lo));
+        out_gate=ggml_mul_mat(ctx,w,lo);
+        if (gate_output) ggml_set_output(out_gate);
+        auto * gate=ggml_sigmoid(ctx,out_gate);
         auto * gated=ggml_reshape_3d(ctx,ggml_mul(ctx,xn,gate),embd,hc,tokens);
         auto * mixed=ggml_cont(ctx,ggml_view_2d(ctx,gated,embd,tokens,embd*hc*sizeof(float),0));
         for(int c=1;c<hc;++c)mixed=ggml_add(ctx,mixed,ggml_view_2d(ctx,gated,embd,tokens,embd*hc*sizeof(float),embd*c*sizeof(float)));
-        return ggml_scale(ctx,mixed,.25f);
+        out_mix=ggml_scale(ctx,mixed,.25f);
+        if (split_reader) {
+            if(gf)ggml_build_forward_expand(gf,out_mix);
+            cut=ggml_scale(ctx,ggml_new_tensor_1d(ctx,GGML_TYPE_F32,64),2.f);
+            if(gf)ggml_build_forward_expand(gf,cut);
+            out_mix=ggml_add(ctx,out_mix,ggml_scale(ctx,ggml_sum_rows(ctx,out_gate),1e-3f));
+            ggml_set_output(out_mix);
+        }
+        return out_mix;
     }
 };
 
@@ -6138,8 +6206,8 @@ struct test_mmb_quant_dense : test_mul_mat {
 
 struct test_mmb_quant_routed : test_mul_mat_id {
     const bool fused;
-    test_mmb_quant_routed(ggml_type type, int tokens, bool broadcast, bool fused, int rows = 128)
-        : test_mul_mat_id(type, GGML_TYPE_F32, 8, 2, broadcast, rows, tokens, 256), fused(fused) {}
+    test_mmb_quant_routed(ggml_type type, int tokens, bool broadcast, bool fused, int rows = 128, int n_mats = 8, int n_used = 2, int inner = 256)
+        : test_mul_mat_id(type, GGML_TYPE_F32, n_mats, n_used, broadcast, rows, tokens, inner), fused(fused) {}
     std::string op_desc(ggml_tensor *) override { return "MMB_QUANT"; }
     std::string vars() override { return test_mul_mat_id::vars() + "," + VAR_TO_STR(fused); }
     bool run_whole_graph() override { return fused; }
@@ -11095,12 +11163,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    for (int tokens : {128, 511, 512, 513, 1024}) {
+    for (int tokens : {31, 32, 128, 511, 512, 513, 1024}) {
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_hc_f32_consumer(tokens, type));
         }
     }
-    for (int tokens : {128, 512, 1024}) {
+    for (int tokens : {31, 32, 128, 512, 1024}) {
         for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_hc_chain(tokens, type));
         }
@@ -11112,6 +11180,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // HC mix with a down projection: BF16 gate weight (no fused gate mix), IQ4_XS down weight (no MMB GEMM)
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_BF16, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS));
+    // the fused gate mix refuses (hc != 4, n_embd % 32 != 0) and hc_mix_reduce reads F32 xn; the model's K with F32 / BF16 gates
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 2));
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 320, 2));
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 320, 4, 2544));
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_F32, GGML_TYPE_Q8_0, 320));
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_BF16, GGML_TYPE_Q8_0, 320));
+    // the fused gate mix refuses for the executor's reader rule: the gate GEMM is a graph output, or has a reader in a later split
+    test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 4, 2560, true));
+    for (int k : {320, 256}) {
+        test_cases.emplace_back(new test_mmb_quant_hc(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, k, 4, 2560, false, true));
+    }
     for (ggml_type type : {GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_mmb_quant_dense(type, 512, 128, 256));
         test_cases.emplace_back(new test_mmb_quant_dense(type, 513, 129, 512));
@@ -11120,9 +11202,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mmb_quant_routed(type, 512, false, true));
         test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true));
         test_cases.emplace_back(new test_mmb_quant_hc(type));
+        test_cases.emplace_back(new test_mmb_quant_hc(type, GGML_TYPE_Q8_0));
         if (type == GGML_TYPE_Q4_K) {
             test_cases.emplace_back(new test_mmb_quant_routed(type, 513, true, true, 65));
             test_cases.emplace_back(new test_mmb_quant_routed(type, 1025, false, true, 129));
+        }
+    }
+    // qwen4exp shapes around the 32-row MMB gate, for the weight types MMB takes: MMQ below it, MMB from it
+    for (int tokens : {16, 31, 32, 33, 127, 128, 473, 511, 512, 513}) {
+        for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+            test_cases.emplace_back(new test_mmb_quant_routed(type, tokens, true, true, 640, 512, 10, 2560));   // routed gate/up + SwiGLU
+            test_cases.emplace_back(new test_mmb_quant_routed(type, tokens, false, false, 2560, 512, 10, 640)); // routed down
+            test_cases.emplace_back(new test_mmb_quant_dense(type, tokens, 640, 2560));
         }
     }
     for (bool ple : {true, false}) {
@@ -11181,6 +11272,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool vis : {false, true}) test_cases.emplace_back(new test_indexer_score(blocks, 512, vis));
     }
     test_cases.emplace_back(new test_indexer_score(3001, 77, true));
+    // 32-508 score rows: MMB for leaf keys, the 512-row gate for keys that are a graph view (the model's pooled-key cache)
+    for (int queries : {8, 31, 127}) {
+        for (bool bounded : {false, true}) test_cases.emplace_back(new test_indexer_score(3001, queries, true, bounded));
+    }
     test_cases.emplace_back(new test_indexer_score(3001, 512, true, true));
     // with the compact visibility chain (fused on RDNA3.5 unless GGML_CUDA_DISABLE_IDX_VIS)
     for (int blocks : {64, 1000, 10112}) test_cases.emplace_back(new test_indexer_head_sum(blocks,4,512,1,false,false,0,1));
@@ -14586,13 +14681,17 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
     return n_fail == 0;
 }
 
-// The CUDA/HIP BF16 WMMA matmul path (mmb) is off unless a context opts in (llama does it for qwen4exp).
-// --mmb picks which path the >=512-token MUL_MAT/MUL_MAT_ID cases test: mmb, or MMQ as every other arch runs.
+// The CUDA/HIP BF16 WMMA matmul path (mmb) is off unless a context opts in (llama opts in its contexts, with the small-batch gate for qwen4exp).
+// --mmb picks which path the >=32-row MUL_MAT/MUL_MAT_ID cases test: mmb with the qwen4exp small-batch gate, or the normal dispatch without mmb.
 static void set_mmb(ggml_backend_t backend, bool enable) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     auto set_mmb_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_enabled");
     if (set_mmb_fn) {
         set_mmb_fn(backend, enable);
+    }
+    auto set_mmb_small_fn = (void (*)(ggml_backend_t, bool)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_mmb_small_batch");
+    if (set_mmb_small_fn) {
+        set_mmb_small_fn(backend, enable);
     }
 }
 
@@ -15009,7 +15108,7 @@ static void usage(char ** argv) {
     printf("  --show-coverage             show test coverage\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
     printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n");
-    printf("  --mmb <on|off>              CUDA/HIP matmuls from 512 tokens use the BF16 WMMA path (on, default; qwen4exp) or MMQ (off; other archs)\n\n");
+    printf("  --mmb <on|off>              CUDA/HIP matmuls from 32 rows use the BF16 WMMA path as in a qwen4exp context (on, default) or the normal dispatch (off)\n\n");
     printf("Examples:\n");
     printf("  %s -j 8\n", argv[0]);
     printf("  %s -o ADD,MUL_MAT\n", argv[0]);
