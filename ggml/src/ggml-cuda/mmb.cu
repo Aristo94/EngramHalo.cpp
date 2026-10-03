@@ -1068,7 +1068,7 @@ bool ggml_cuda_mmb_supported_mm(ggml_backend_cuda_context & ctx, const ggml_tens
 
 bool ggml_cuda_mmb_supported_mmid(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled(ctx)) return false;
-    if (!mmb_quant_type(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
+    if (!mmb_quant_type(src0->type, /*routed=*/true) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) return false;
     if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
     const int64_t K = src0->ne[0], M = src0->ne[1], E = src0->ne[2];
     if (src0->ne[3] != 1 || K % 64 != 0 || E < 1 || E > 1024) return false;
@@ -1331,7 +1331,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
 
 bool ggml_cuda_mmb_supported_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu) {
     if (!mmb_enabled(ctx) || !mmb_glu() || !gw || !uw || !src1 || !ids || !glu) return false;
-    if (!mmb_quant_type(gw->type) || uw->type != gw->type) return false;
+    if (!mmb_quant_type(gw->type, /*routed=*/true) || uw->type != gw->type) return false;
     if (!ggml_are_same_shape(gw, uw) || gw->nb[1] != uw->nb[1] || gw->nb[2] != uw->nb[2]) return false;
     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) return false;
     if (glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) || !glu->src[0] || !glu->src[1]) return false;
