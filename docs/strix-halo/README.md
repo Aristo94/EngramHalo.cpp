@@ -174,6 +174,21 @@ Rules of thumb that cost nothing:
 * `-ub 2048` needs the current PR head (per-block QSA bias, #27742) — included
   in this branch, but not one of its commits;
 * `-t 4` in mmap mode; thread count stops mattering with `-lm none`.
+* bigger quants on smaller boxes: if a larger quant (e.g. UD-Q4_K_XL on a
+  96 GB board) does not fit, raise `--n-cpu-moe` step by step instead of
+  lowering `-ngl`. Each step spills more expert weights to the host and
+  costs decode, but keeps the attention path on the GPU. Use mmap mode
+  (`-lm mmap`, also what `auto` picks when every device supports mmap): the
+  spilled experts then stay file-backed (`CPU_Mapped`), so they leave GTT
+  and the kernel can evict them. 12 of 48 layers spilled on this box (`-t 8`): GTT
+  45 -> 37 GiB, decode 23.5 -> 20.4 t/s. The `-v` lines `buffer type
+  overridden to ROCm_Host` only name the preferred type; check the
+  `model buffer size` lines for where the weights really are. In RAM mode
+  (`-lm none`) the spilled experts land in pinned host memory: GTT drops
+  the same, but total RAM use does not, so this only helps when the GTT
+  limit binds, not physical RAM. `--no-host` helps in neither mode (same
+  footprint plus a 1.3 GiB repack copy). All other numbers in this document
+  are `--n-cpu-moe 0`.
 
 ## Building the MTP sidecar
 
