@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
+#include "../src/llama-model.h"
 
 #include <algorithm>
 #include <cmath>
@@ -318,6 +319,132 @@ static bool run_scenario_b(llama_model * model, int n_vocab, bool gather, logits
     return ok;
 }
 
+struct selection_check {
+    const llama_model * model;
+    bool enabled = false;
+    bool ok = true;
+    size_t rows_checked = 0;
+    size_t rows_reversed = 0;
+    int64_t n_kv = 0;
+    int64_t width = 0;
+    std::vector<float> scores;
+};
+
+// Observe the real model graph. Reversing a TOP_K row preserves its set and exercises its unordered contract.
+static bool check_selection(ggml_tensor * t, bool ask, void * user_data) {
+    auto & check = *(selection_check *) user_data;
+    int il = -1;
+    const bool score = sscanf(t->name, "indexer_score_tokens-%d", &il) == 1;
+    const bool selected = strncmp(t->name, "indexer_top_k-", 14) == 0;
+    const bool top_k = t->op == GGML_OP_TOP_K && t->src[0] &&
+            strncmp(t->src[0]->name, "indexer_score_tokens-", 21) == 0;
+    if (ask) {
+        return check.enabled && (score || selected || top_k);
+    }
+    if (score) {
+        GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t));
+        check.n_kv = t->ne[0];
+        check.width = std::min<int64_t>(check.n_kv,
+                check.model->hparams.indexer_top_k + check.model->hparams.dsv4_compress_ratios[il] - 1);
+        check.scores.resize(ggml_nelements(t));
+        ggml_backend_tensor_get(t, check.scores.data(), 0, ggml_nbytes(t));
+        for (size_t i = 0; i < check.scores.size(); ++i) {
+            if (std::isfinite(check.scores[i])) {
+                check.scores[i] = float(i % check.n_kv);
+            }
+        }
+        ggml_backend_tensor_set(t, check.scores.data(), 0, ggml_nbytes(t));
+        return true;
+    }
+    GGML_ASSERT(t->type == GGML_TYPE_I32 && ggml_is_contiguous(t));
+    std::vector<int32_t> indices(ggml_nelements(t));
+    ggml_backend_tensor_get(t, indices.data(), 0, ggml_nbytes(t));
+    const int64_t n_sel = t->ne[0];
+    const int64_t n_rows = ggml_nelements(t)/n_sel;
+    if (top_k) {
+        if (check.rows_reversed == 0) {
+            printf("QSA TOP_K buffer=%s selected=%lld\n", ggml_backend_buffer_name(t->buffer), (long long) n_sel);
+        }
+        for (int64_t row = 0; row < n_rows; ++row) {
+            std::reverse(indices.begin() + row*n_sel, indices.begin() + (row + 1)*n_sel);
+            check.rows_reversed++;
+        }
+        ggml_backend_tensor_set(t, indices.data(), 0, ggml_nbytes(t));
+        return true;
+    }
+    if (n_sel <= check.width) {
+        return true;
+    }
+    GGML_ASSERT(check.scores.size() == size_t(n_rows*check.n_kv));
+    for (int64_t row = 0; row < n_rows; ++row) {
+        std::vector<int32_t> expected(check.n_kv);
+        for (int64_t i = 0; i < check.n_kv; ++i) {
+            expected[i] = i;
+        }
+        std::partial_sort(expected.begin(), expected.begin() + check.width, expected.end(),
+                [&](int32_t a, int32_t b) { return check.scores[row*check.n_kv + a] > check.scores[row*check.n_kv + b]; });
+        expected.resize(check.width);
+        std::sort(expected.begin(), expected.end());
+        std::vector<int32_t> visible(indices.begin() + row*n_sel, indices.begin() + row*n_sel + check.width);
+        std::sort(visible.begin(), visible.end());
+        if (visible != expected) {
+            fprintf(stderr, "QSA selection lost a required member: width=%lld padded=%lld row=%lld\n",
+                    (long long) check.width, (long long) n_sel, (long long) row);
+            check.ok = false;
+            return false;
+        }
+        for (int64_t i = check.width; i < n_sel; ++i) {
+            if (!std::binary_search(expected.begin(), expected.end(), indices[row*n_sel + i])) {
+                fprintf(stderr, "QSA padding contains an unselected cell\n");
+                check.ok = false;
+                return false;
+            }
+        }
+        check.rows_checked++;
+    }
+    return true;
+}
+
+static bool run_selection_check(llama_model * model, int n_vocab, int n_ubatch = 512) {
+    const int width = model->hparams.indexer_top_k + 3;
+    const int n_prefix = std::max(2049, int(GGML_PAD(width, 256)) + 3);
+    selection_check check { model };
+    llama_context_params cparams = llama_context_default_params();
+    cparams.n_ctx = GGML_PAD(n_prefix + 16, 256);
+    cparams.n_batch = 512;
+    cparams.n_ubatch = n_ubatch;
+    cparams.n_threads = 4;
+    cparams.n_threads_batch = 4;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cparams.cb_eval = check_selection;
+    cparams.cb_eval_user_data = &check;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        return false;
+    }
+    llama_batch batch = llama_batch_init(512, 0, 1);
+    bool ok = true;
+    for (int pos = 0; pos < n_prefix && ok;) {
+        common_batch_clear(batch);
+        for (; pos < n_prefix && batch.n_tokens < 512; ++pos) {
+            common_batch_add(batch, tok_at(0, pos, n_vocab), pos, {0}, false);
+        }
+        ok = llama_decode(ctx, batch) == 0;
+    }
+    check.enabled = true;
+    for (int pos = n_prefix; pos < n_prefix + 3 && ok; ++pos) {
+        common_batch_clear(batch);
+        common_batch_add(batch, tok_at(0, pos, n_vocab), pos, {0}, true);
+        ok = llama_decode(ctx, batch) == 0;
+    }
+    ok = ok && check.ok && check.rows_checked > 0 && check.rows_reversed > 0;
+    printf("QSA unordered selection: %zu padded rows checked, %zu TOP_K rows reversed -> %s\n",
+            check.rows_checked, check.rows_reversed, ok ? "OK" : "FAIL");
+    llama_batch_free(batch);
+    llama_free(ctx);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     common_params params;
 
@@ -351,7 +478,11 @@ int main(int argc, char ** argv) {
 
     bool ok = true;
 
-    {
+    ok = run_selection_check(model, n_vocab);
+
+    if (model->hparams.ple_n_heads > 0) {
+        printf("scenario A: SKIP (PLE does not support tokens shared by multiple sequences)\n");
+    } else {
         logits_map ref;
         logits_map res;
         ok = ok && run_scenario_a(model, n_vocab, /*gather =*/ false, ref);

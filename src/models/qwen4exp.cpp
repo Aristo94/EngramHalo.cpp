@@ -885,7 +885,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // build_attn_qsa_gather masks the extra entries out again, so the visible set stays `width`
     const int64_t n_sel = std::max<int64_t>(width, qsa_gather_n_sel(n_kv, width));
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, n_sel));
+    // TOP_K may return an unordered set. Select the visible width before adding masked padding.
+    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+    if (n_sel > width) {
+        const int64_t n_pad = n_sel - width;
+        ggml_tensor * pad = top_k;
+        if (n_pad > width) {
+            pad = ggml_repeat_4d(ctx0, pad, width*((n_pad + width - 1)/width), n_tps, n_stream, 1);
+        }
+        pad = ggml_cont(ctx0, ggml_view_3d(ctx0, pad,
+                n_pad, n_tps, n_stream, pad->nb[1], pad->nb[2], 0));
+        top_k = ggml_concat(ctx0, top_k, pad, 0);
+    }
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
     top_k = ggml_reshape_4d(ctx0, top_k, n_sel, n_tps, 1, n_stream);

@@ -219,7 +219,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(
         test-qsa-gather-ms
         LABEL main
-        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf"
+        ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf" --override-kv "qwen4exp.attention.indexer.top_k=int:8"
     )
     set_tests_properties(test-qsa-gather-ms PROPERTIES
         FIXTURES_REQUIRED generate-models
